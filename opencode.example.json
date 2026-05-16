@@ -1,0 +1,125 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "gemini-local/gemini-flash-latest",
+  "provider": {
+    "gemini-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Gemini Local Failover",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "{env:LOCAL_PROVIDER_KEY}"
+      },
+      "models": {
+        "gemini-flash-latest": {
+          "name": "Gemini Flash Latest",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "variants": {
+            "minimal": {
+              "reasoningEffort": "minimal"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "gemini-flash-latest-minimal": {
+          "name": "Gemini Flash Latest · Minimal reasoning",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "options": {
+            "reasoningEffort": "minimal"
+          }
+        },
+        "gemini-flash-latest-low": {
+          "name": "Gemini Flash Latest · Low reasoning",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "options": {
+            "reasoningEffort": "low"
+          }
+        },
+        "gemini-flash-latest-medium": {
+          "name": "Gemini Flash Latest · Medium reasoning",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "options": {
+            "reasoningEffort": "medium"
+          }
+        },
+        "gemini-flash-latest-high": {
+          "name": "Gemini Flash Latest · High reasoning",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "options": {
+            "reasoningEffort": "high"
+          }
+        },
+        "gemini-2.5-flash": {
+          "name": "Gemini 2.5 Flash",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "variants": {
+            "none": {
+              "reasoningEffort": "none"
+            },
+            "minimal": {
+              "reasoningEffort": "minimal"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "gemini-2.5-flash-lite": {
+          "name": "Gemini 2.5 Flash-Lite",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "variants": {
+            "none": {
+              "reasoningEffort": "none"
+            },
+            "minimal": {
+              "reasoningEffort": "minimal"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        }
+      }
+    }
+  }
+}
