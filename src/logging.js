@@ -94,8 +94,65 @@ export function logUpstreamOk(keyIndex, totalKeys, maskedKey, model, streamMode)
   console.log(`[ok] key=${keyIndex}/${totalKeys} ${maskedKey} model=${model} stream=${streamMode}`);
 }
 
+const UPSTREAM_ERROR_LOG_SNIPPET_CHARS = Math.max(
+  1,
+  Number(process.env.UPSTREAM_ERROR_LOG_SNIPPET_CHARS || 2000)
+);
+
 export function logUpstreamFail(keyIndex, totalKeys, status, message) {
   console.warn(`[fail] key=${keyIndex}/${totalKeys} status=${status} ${message}`);
+}
+
+export function logUpstreamFailDetailed(keyIndex, totalKeys, {
+  status,
+  model,
+  kind,
+  code,
+  reason,
+  bodySnippet,
+  contentType,
+  providerCode,
+  providerStatus,
+  requestShape,
+}) {
+  const parts = [`[fail] key=${keyIndex}/${totalKeys}`];
+  if (status != null) parts.push(`status=${status}`);
+  if (model) parts.push(`model=${model}`);
+  if (kind) parts.push(`kind=${kind}`);
+  if (code) parts.push(`code=${code}`);
+  if (contentType) parts.push(`contentType=${contentType}`);
+  if (providerCode) parts.push(`providerCode=${providerCode}`);
+  if (providerStatus) parts.push(`providerStatus=${providerStatus}`);
+  if (reason) parts.push(`reason=${reason}`);
+  if (requestShape) {
+    const shapeSummary = JSON.stringify(requestShape);
+    parts.push(`shape=${shapeSummary}`);
+  }
+  console.warn(parts.join(" "));
+
+  if (bodySnippet) {
+    console.warn(`[fail-body] key=${keyIndex}/${totalKeys} ${bodySnippet}`);
+  }
+}
+
+export function getUpstreamErrorSnippet(errorPayload) {
+  if (!errorPayload) return "";
+  if (typeof errorPayload === "string") {
+    return String(errorPayload).slice(0, UPSTREAM_ERROR_LOG_SNIPPET_CHARS);
+  }
+  try {
+    const safe = {
+      error: {
+        message: String(errorPayload?.error?.message || "").slice(0, UPSTREAM_ERROR_LOG_SNIPPET_CHARS),
+        code: errorPayload?.error?.code,
+        status: errorPayload?.error?.status,
+        type: errorPayload?.error?.type,
+      },
+    };
+    return JSON.stringify(safe);
+  } catch {
+    return String(errorPayload || "").slice(0, UPSTREAM_ERROR_LOG_SNIPPET_CHARS);
+  }
 }
 
 export function logNetworkError(keyIndex, totalKeys, message) {

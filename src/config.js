@@ -34,6 +34,17 @@ export const config = {
   maxTotalAttachmentBytes: Math.max(1, Number(env.MAX_TOTAL_ATTACHMENT_BYTES || 104857600)), // 100MB default
   fileTextMaxChars: Math.max(1, Number(env.FILE_TEXT_MAX_CHARS || 200000)),
   remoteFetchTimeoutMs: Math.max(1000, Number(env.REMOTE_FETCH_TIMEOUT_MS || 10000)),
+
+  // Upstream error handling
+  maxUpstream500FailoverAttempts: Math.max(1, Number(env.MAX_UPSTREAM_500_FAILOVER_ATTEMPTS || 2)),
+  upstream500FingerprintTtlMs: Math.max(1000, Number(env.UPSTREAM_500_FINGERPRINT_TTL_MS || 300000)),
+  upstreamErrorLogSnippetChars: Math.max(1, Number(env.UPSTREAM_ERROR_LOG_SNIPPET_CHARS || 2000)),
+
+  // Model capability validation
+  unknownModelCapabilityMode: (env.UNKNOWN_MODEL_CAPABILITY_MODE || "permissive").toLowerCase(),
+  gemmaAllowVision: String(env.GEMMA_ALLOW_VISION || "false").toLowerCase() === "true",
+  gemmaAllowTools: String(env.GEMMA_ALLOW_TOOLS || "false").toLowerCase() === "true",
+  gemmaAllowReasoningEffort: String(env.GEMMA_ALLOW_REASONING_EFFORT || "false").toLowerCase() === "true",
 };
 
 export const SUPPORTED_IMAGE_MIMES = new Set([

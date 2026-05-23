@@ -6,6 +6,8 @@ import {
   logRequestStart,
   logUpstreamOk,
   logUpstreamFail,
+  logUpstreamFailDetailed,
+  getUpstreamErrorSnippet,
   logNetworkError,
   logKeyDisabled,
   logKeyCooldown,
@@ -21,6 +23,18 @@ import {
   MultimodalError,
   normalizeContent,
 } from "./src/multimodal.js";
+import {
+  classifyUpstreamError,
+  createFingerprintTracker,
+  createRequestFingerprint,
+  buildRequestShape,
+} from "./src/upstream-errors.js";
+import {
+  getModelCapabilities,
+  validateModelCapabilities,
+  getCapabilitiesReport,
+  ProviderRequestError,
+} from "./src/model-capabilities.js";
 
 const GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai";
 const GEMINI_GENERATE_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -39,6 +53,9 @@ const {
   thoughtSignatureDummyFallback,
   thoughtSignatureCacheTtlMs,
   thoughtSignatureCacheMaxEntries,
+  maxUpstream500FailoverAttempts,
+  upstream500FingerprintTtlMs,
+  upstreamErrorLogSnippetChars,
 } = config;
 
 const env = process.env;
@@ -113,6 +130,11 @@ function createThoughtSignatureCache({ ttlMs, maxEntries }) {
 const thoughtSignatureByToolCallId = createThoughtSignatureCache({
   ttlMs: thoughtSignatureCacheTtlMs,
   maxEntries: thoughtSignatureCacheMaxEntries,
+});
+
+const fingerprintTracker = createFingerprintTracker({
+  maxAttempts: maxUpstream500FailoverAttempts,
+  ttlMs: upstream500FingerprintTtlMs,
 });
 
 const DUMMY_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
@@ -200,6 +222,21 @@ function shouldFailover(status, errorPayload) {
     text.includes("billing") ||
     text.includes("overloaded")
   );
+}
+
+function applyClassifiedFailure(key, classification, headers) {
+  const totalKeysForLog = Math.max(keyState.length, key.index + 1);
+
+  if (classification.shouldCooldownKey) {
+    const cooldownMs = retryAfterMs(headers) || keyCooldownMs;
+    key.cooldownUntil = now() + Math.max(keyCooldownMs, cooldownMs);
+    logKeyCooldown(key.index + 1, totalKeysForLog, key.cooldownUntil);
+  }
+
+  if (classification.kind === "key_auth") {
+    key.disabled = true;
+    logKeyDisabled(key.index + 1, totalKeysForLog, maskKey(key.key));
+  }
 }
 
 async function parseErrorPayload(response) {
@@ -491,9 +528,11 @@ async function applyMultimodalNormalization(payload, originalMessages) {
   return payload;
 }
 
-async function upstreamChatCompletion(payload, streamMode) {
+async function upstreamChatCompletion(payload, streamMode, requestContext = {}) {
   const attemptsLimit = Math.min(maxAttemptsPerRequest, keyState.length);
   const errors = [];
+  const requestShape = requestContext.requestShape || buildRequestShape(payload, requestContext.originalMessages);
+  const fingerprint = createRequestFingerprint(requestShape);
 
   for (let attempt = 1; attempt <= attemptsLimit; attempt++) {
     let key = getNextKey();
@@ -528,16 +567,59 @@ async function upstreamChatCompletion(payload, streamMode) {
 
       const errorPayload = await parseErrorPayload(response);
       const message = errorPayload?.error?.message || `HTTP ${response.status}`;
+      const contentType = response.headers.get("content-type") || "";
+      const providerCode = errorPayload?.error?.code;
+      const providerStatus = errorPayload?.error?.status;
+
+      const classification = classifyUpstreamError(response.status, errorPayload, requestShape);
       key.lastError = `${response.status}: ${message}`;
-      errors.push({ key: key.index + 1, status: response.status, message });
+      errors.push({
+        key: key.index + 1,
+        status: response.status,
+        message,
+        kind: classification.kind,
+        code: classification.code,
+      });
 
-      logUpstreamFail(key.index + 1, keyState.length, response.status, message);
+      const bodySnippet = getUpstreamErrorSnippet(errorPayload);
 
-      if (!shouldFailover(response.status, errorPayload)) {
-        return { response: null, errorStatus: response.status, errorPayload };
+      logUpstreamFailDetailed(key.index + 1, keyState.length, {
+        status: response.status,
+        model: payload.model,
+        kind: classification.kind,
+        code: classification.code,
+        reason: classification.reason,
+        bodySnippet,
+        contentType,
+        providerCode,
+        providerStatus,
+        requestShape,
+      });
+
+      // Maintain backward-compatible log line
+      logUpstreamFail(key.index + 1, keyState.length, response.status, `${classification.kind}: ${message}`);
+
+      if (!classification.shouldFailover) {
+        return {
+          response: null,
+          errorStatus: classification.clientStatus,
+          errorPayload: buildClientError(classification, errors, requestShape),
+        };
       }
 
-      applyKeyFailureState(key, response.status, response.headers, keyCooldownMs);
+      // Fingerprint guard for 500s: stop retrying if same shape fails on too many keys
+      if (response.status === 500 && classification.kind !== "transient_provider") {
+        const track = fingerprintTracker.recordAttempt(fingerprint, key.index + 1, classification);
+        if (fingerprintTracker.isBlocked(fingerprint)) {
+          return {
+            response: null,
+            errorStatus: 502,
+            errorPayload: buildFingerprintBlockedError(requestShape, track),
+          };
+        }
+      }
+
+      applyClassifiedFailure(key, classification, response.headers);
     } catch (e) {
       clearTimeout(timeout);
       key.lastError = e.message;
@@ -553,7 +635,59 @@ async function upstreamChatCompletion(payload, streamMode) {
     errorPayload: {
       error: {
         message: "All Gemini keys failed or are cooling down",
+        code: "all_keys_exhausted",
         attempts: errors,
+      },
+    },
+  };
+}
+
+function buildClientError(classification, errors, requestShape) {
+  const details = {
+    kind: classification.kind,
+    code: classification.code,
+    model: requestShape.model,
+    hasImages: requestShape.hasImages,
+    hasTools: requestShape.hasTools,
+    hasToolChoice: requestShape.hasToolChoice,
+    reasoningEffort: requestShape.reasoningEffort,
+    attempts: errors,
+    hint: "This may be an unsupported model/capability combination. Try a Gemini Flash model, disable tools, disable image input, or lower/remove reasoning_effort.",
+  };
+
+  if (classification.kind === "safety_or_policy") {
+    details.hint = "The request was rejected by upstream safety/policy filters.";
+  }
+
+  return {
+    error: {
+      message: classification.reason,
+      code: classification.code,
+      details,
+    },
+  };
+}
+
+function buildFingerprintBlockedError(requestShape, track) {
+  const attemptSummaries = (track.attempts || []).map((a) => ({
+    key: a.keyIndex,
+    status: a.status,
+    kind: a.kind,
+  }));
+
+  return {
+    error: {
+      message: "Upstream model failed repeatedly for the same request shape; not retrying more keys.",
+      code: "upstream_model_payload_error",
+      details: {
+        model: requestShape.model,
+        status: 500,
+        attempts: attemptSummaries,
+        hasImages: requestShape.hasImages,
+        hasTools: requestShape.hasTools,
+        hasToolChoice: requestShape.hasToolChoice,
+        reasoningEffort: requestShape.reasoningEffort,
+        hint: "This may be an unsupported model/capability combination. Try a Gemini Flash model, disable tools, disable image input, or lower/remove reasoning_effort.",
       },
     },
   };
@@ -608,7 +742,20 @@ async function handleChatCompletions(req, res) {
     logDebugNormalizedPayload(payload);
   }
 
-  const result = await upstreamChatCompletion(payload, streamMode);
+  // Model capability validation
+  const requestShape = buildRequestShape(payload, rawBody.messages);
+  try {
+    validateModelCapabilities(payload, requestShape, { stripReasoning: true });
+  } catch (e) {
+    if (e instanceof ProviderRequestError) {
+      return sendJson(res, e.status || 400, {
+        error: { message: e.message, code: e.code, details: e.details, hint: e.hint },
+      });
+    }
+    return sendJson(res, 400, { error: { message: e.message } });
+  }
+
+  const result = await upstreamChatCompletion(payload, streamMode, { requestShape, originalMessages: rawBody.messages });
 
   if (!result.response) {
     return sendJson(res, result.errorStatus || 503, result.errorPayload);
@@ -943,12 +1090,30 @@ async function handleOllamaChat(req, res) {
     logDebugNormalizedPayload(openAiPayload);
   }
 
-  const result = await upstreamChatCompletion(openAiPayload, streamMode);
+  // Model capability validation
+  const requestShape = buildRequestShape(openAiPayload, openAiMessages);
+  try {
+    validateModelCapabilities(openAiPayload, requestShape, { stripReasoning: true });
+  } catch (e) {
+    if (e instanceof ProviderRequestError) {
+      return sendJson(res, e.status || 400, {
+        error: e.message,
+        code: e.code,
+        details: e.details,
+        hint: e.hint,
+      });
+    }
+    return sendJson(res, 400, { error: e.message });
+  }
+
+  const result = await upstreamChatCompletion(openAiPayload, streamMode, { requestShape, originalMessages: openAiMessages });
 
   if (!result.response) {
     const status = result.errorStatus || 503;
     const message = result.errorPayload?.error?.message || `HTTP ${status}`;
-    return sendJson(res, status, { error: message });
+    const code = result.errorPayload?.error?.code;
+    const details = result.errorPayload?.error?.details;
+    return sendJson(res, status, { error: message, code, details });
   }
 
   const upstream = result.response;
@@ -1159,6 +1324,31 @@ async function handleDebugModelVersion(req, res) {
 }
 
 // =============================================================================
+// Debug model capabilities endpoint
+// =============================================================================
+
+function handleDebugModelCapabilities(req, res) {
+  if (!isAuthorized(req)) {
+    return sendJson(res, 401, { error: { message: "Unauthorized local provider key" } });
+  }
+
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const requestedModel = url.searchParams.get("model") || null;
+
+  const report = getCapabilitiesReport();
+
+  if (requestedModel) {
+    const caps = getModelCapabilities(requestedModel);
+    report.singleModel = {
+      model: requestedModel,
+      capabilities: caps,
+    };
+  }
+
+  sendJson(res, 200, report);
+}
+
+// =============================================================================
 // HTTP server
 // =============================================================================
 
@@ -1182,9 +1372,12 @@ export const server = http.createServer(async (req, res) => {
       return handleChatCompletions(req, res);
     }
 
-    // Debug endpoint (protected by auth + env flag)
+    // Debug endpoints (protected by auth)
     if (req.method === "GET" && normalizedPath === "/debug/model-version") {
       return handleDebugModelVersion(req, res);
+    }
+    if (req.method === "GET" && normalizedPath === "/debug/model-capabilities") {
+      return handleDebugModelCapabilities(req, res);
     }
 
     // Ollama-compatible surface
@@ -1222,12 +1415,22 @@ export {
   createThoughtSignatureCache,
   createKeyState,
   applyKeyFailureState,
+  applyClassifiedFailure,
   ollamaMessagesToOpenAI,
   ollamaToolsToOpenAI,
   ollamaOptionsToOpenAI,
   openAiToolCallsToOllama,
   stripModelTag,
   OLLAMA_FAKE_VERSION,
+  fingerprintTracker,
+  classifyUpstreamError,
+  buildRequestShape,
+  createRequestFingerprint,
+  buildClientError,
+  buildFingerprintBlockedError,
+  validateModelCapabilities,
+  getModelCapabilities,
+  getCapabilitiesReport,
 };
 
 function startServer() {

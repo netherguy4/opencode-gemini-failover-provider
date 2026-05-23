@@ -11,6 +11,7 @@ const {
   cacheToolCallsFromCompletionPayload,
   createThoughtSignatureCache,
   applyKeyFailureState,
+  applyClassifiedFailure,
   createKeyState,
   thoughtSignatureByToolCallId,
   readThoughtSignatureFromToolCall,
@@ -20,11 +21,15 @@ const {
   openAiToolCallsToOllama,
   stripModelTag,
   OLLAMA_FAKE_VERSION,
+  fingerprintTracker,
 } = mod;
 
 // Import multimodal module for direct unit tests
 const multimodal = await import("./src/multimodal.js");
 const config = await import("./src/config.js");
+const upstreamErrors = await import("./src/upstream-errors.js");
+const modelCapabilities = await import("./src/model-capabilities.js");
+const logging = await import("./src/logging.js");
 
 // =============================================================================
 // Existing tests (preserved from original)
@@ -1099,6 +1104,602 @@ test("/debug/model-version requires auth", async () => {
     // Should be 401 (wrong auth) or 403 (no auth + disabled)
     assert.ok(response.status === 401 || response.status === 403);
   } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+// =============================================================================
+// Upstream error classification tests
+// =============================================================================
+
+test("classifyUpstreamError: 401 disables key and failovers", () => {
+  const result = upstreamErrors.classifyUpstreamError(401, {
+    error: { message: "Invalid API key" },
+  });
+  assert.equal(result.kind, "key_auth");
+  assert.equal(result.shouldFailover, true);
+  assert.equal(result.shouldCooldownKey, false);
+  assert.equal(result.clientStatus, 401);
+});
+
+test("classifyUpstreamError: 429 cooldowns key and failovers", () => {
+  const result = upstreamErrors.classifyUpstreamError(429, {
+    error: { message: "Rate limit exceeded" },
+  });
+  assert.equal(result.kind, "rate_limit");
+  assert.equal(result.shouldFailover, true);
+  assert.equal(result.shouldCooldownKey, true);
+});
+
+test("classifyUpstreamError: 502/503/504 cooldowns key and failovers", () => {
+  for (const status of [502, 503, 504]) {
+    const result = upstreamErrors.classifyUpstreamError(status, { error: { message: "Server error" } });
+    assert.equal(result.kind, "transient_provider");
+    assert.equal(result.shouldFailover, true);
+    assert.equal(result.shouldCooldownKey, true);
+  }
+});
+
+test("classifyUpstreamError: 500 with overloaded is transient", () => {
+  const result = upstreamErrors.classifyUpstreamError(500, {
+    error: { message: "Service is overloaded, try again later" },
+  });
+  assert.equal(result.kind, "transient_provider");
+  assert.equal(result.shouldFailover, true);
+  assert.equal(result.shouldCooldownKey, true);
+});
+
+test("classifyUpstreamError: 500 with generic body is guarded by fingerprint logic", () => {
+  const result = upstreamErrors.classifyUpstreamError(500, {
+    error: { message: "Internal error" },
+  }, { hasImages: false, hasTools: false, hasToolChoice: false });
+  // Not transient indicators, no suspicious combo -> unknown_upstream
+  assert.equal(result.kind, "unknown_upstream");
+  assert.equal(result.shouldFailover, true);
+  assert.equal(result.shouldCooldownKey, true);
+});
+
+test("classifyUpstreamError: 500 with risky combo classifies as payload_or_model", () => {
+  const result = upstreamErrors.classifyUpstreamError(500, {
+    error: { message: "Internal error" },
+  }, {
+    model: "gemma-4-31b-it",
+    hasImages: true,
+    hasTools: true,
+    hasToolChoice: true,
+    reasoningEffort: "high",
+    hasFiles: false,
+    numMessages: 10,
+  });
+  assert.equal(result.kind, "payload_or_model");
+  assert.equal(result.shouldFailover, false);
+  assert.equal(result.shouldCooldownKey, false);
+  assert.equal(result.code, "upstream_model_payload_error");
+});
+
+test("classifyUpstreamError: 403 with quota/billing text shouldFailover true", () => {
+  const result = upstreamErrors.classifyUpstreamError(403, {
+    error: { message: "Quota exceeded for this key" },
+  });
+  assert.equal(result.shouldFailover, true);
+});
+
+test("classifyUpstreamError: 403 without quota/billing text shouldFailover false", () => {
+  const result = upstreamErrors.classifyUpstreamError(403, {
+    error: { message: "Request blocked by safety policy" },
+  });
+  assert.equal(result.shouldFailover, false);
+  assert.equal(result.kind, "safety_or_policy");
+});
+
+test("classifyUpstreamError: 402 billing failovers", () => {
+  const result = upstreamErrors.classifyUpstreamError(402, { error: { message: "Billing required" } });
+  assert.equal(result.kind, "billing");
+  assert.equal(result.shouldFailover, true);
+  assert.equal(result.shouldCooldownKey, true);
+});
+
+// =============================================================================
+// Fingerprint tracking tests
+// =============================================================================
+
+test("createFingerprintTracker: blocks after configured attempts", () => {
+  const tracker = upstreamErrors.createFingerprintTracker({ maxAttempts: 2, ttlMs: 3600000 });
+  const fp = "test-fingerprint-abc";
+
+  assert.equal(tracker.isBlocked(fp), false);
+
+  tracker.recordAttempt(fp, 1, { kind: "unknown_upstream", code: "upstream_unknown_500" });
+  assert.equal(tracker.isBlocked(fp), false);
+
+  tracker.recordAttempt(fp, 2, { kind: "unknown_upstream", code: "upstream_unknown_500" });
+  assert.equal(tracker.isBlocked(fp), true);
+});
+
+test("createFingerprintTracker: entries expire after TTL", () => {
+  const tracker = upstreamErrors.createFingerprintTracker({ maxAttempts: 2, ttlMs: 5 });
+  const fp = "expires-quickly";
+
+  tracker.recordAttempt(fp, 1, { kind: "unknown_upstream" });
+  tracker.recordAttempt(fp, 2, { kind: "unknown_upstream" });
+  assert.equal(tracker.isBlocked(fp), true);
+
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      assert.equal(tracker.isBlocked(fp), false);
+      resolve();
+    }, 20);
+  });
+});
+
+test("createFingerprintTracker: tracks attempts per fingerprint independently", () => {
+  const tracker = upstreamErrors.createFingerprintTracker({ maxAttempts: 2, ttlMs: 60000 });
+  const fp1 = "fp-1";
+  const fp2 = "fp-2";
+
+  tracker.recordAttempt(fp1, 1, { kind: "unknown_upstream" });
+  tracker.recordAttempt(fp1, 2, { kind: "unknown_upstream" });
+  assert.equal(tracker.isBlocked(fp1), true);
+  assert.equal(tracker.isBlocked(fp2), false);
+});
+
+// =============================================================================
+// Request fingerprint building tests
+// =============================================================================
+
+test("buildRequestShape: extracts shape without secrets", () => {
+  const shape = upstreamErrors.buildRequestShape({
+    model: "gemma-4-31b-it",
+    stream: true,
+    tools: [{ type: "function", function: { name: "search" } }],
+    tool_choice: "auto",
+    reasoning_effort: "high",
+  }, [
+    { role: "user", content: "hello world" },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "What is in this image?" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+      ],
+    },
+  ]);
+
+  assert.equal(shape.model, "gemma-4-31b-it");
+  assert.equal(shape.stream, true);
+  assert.equal(shape.hasImages, true);
+  assert.equal(shape.hasFiles, false);
+  assert.equal(shape.hasTools, true);
+  assert.equal(shape.hasToolChoice, true);
+  assert.equal(shape.reasoningEffort, "high");
+  assert.equal(shape.numMessages, 2);
+  assert.ok(shape.contentPartTypes.includes("text"));
+  assert.ok(shape.contentPartTypes.includes("image_url"));
+  // Must not contain prompt text
+  assert.equal(JSON.stringify(shape).includes("What is in this image?"), false);
+  // Must not contain base64 data
+  assert.equal(JSON.stringify(shape).includes("iVBORw0KGgo="), false);
+});
+
+test("createRequestFingerprint: same shape yields same fingerprint", () => {
+  const shape1 = {
+    model: "gemma-4-31b-it",
+    stream: true,
+    hasImages: true,
+    hasFiles: false,
+    hasTools: true,
+    hasToolChoice: true,
+    reasoningEffort: "high",
+    numMessages: 10,
+    messageRoles: ["user", "assistant"],
+    contentPartTypes: ["text", "image_url"],
+    attachmentMimeTypes: ["image/png"],
+    attachmentSizeBuckets: ["<1MB"],
+  };
+  const shape2 = { ...shape1 };
+
+  const fp1 = upstreamErrors.createRequestFingerprint(shape1);
+  const fp2 = upstreamErrors.createRequestFingerprint(shape2);
+  assert.equal(fp1, fp2);
+});
+
+test("createRequestFingerprint: different shapes yield different fingerprints", () => {
+  const shape1 = {
+    model: "gemma-4-31b-it", stream: true, hasImages: false, hasFiles: false,
+    hasTools: false, hasToolChoice: false, reasoningEffort: "", numMessages: 1,
+    messageRoles: ["user"], contentPartTypes: ["text"], attachmentMimeTypes: [], attachmentSizeBuckets: ["0"],
+  };
+  const shape2 = { ...shape1, hasImages: true, attachmentMimeTypes: ["image/png"], attachmentSizeBuckets: ["<1MB"] };
+
+  const fp1 = upstreamErrors.createRequestFingerprint(shape1);
+  const fp2 = upstreamErrors.createRequestFingerprint(shape2);
+  assert.notEqual(fp1, fp2);
+});
+
+// =============================================================================
+// Model capability validation tests
+// =============================================================================
+
+test("getModelCapabilities: gemma-4-31b-it has no vision/tools/reasoning by default", () => {
+  const caps = modelCapabilities.getModelCapabilities("gemma-4-31b-it");
+  assert.equal(caps.vision, false);
+  assert.equal(caps.tools, false);
+  assert.equal(caps.reasoningEffort, false);
+  assert.equal(caps.fileText, true);
+});
+
+test("getModelCapabilities: gemini-flash-latest supports all", () => {
+  const caps = modelCapabilities.getModelCapabilities("gemini-flash-latest");
+  assert.equal(caps.vision, true);
+  assert.equal(caps.tools, true);
+  assert.equal(caps.reasoningEffort, true);
+});
+
+test("getModelCapabilities: gemini-2.5-flash-lite supports all", () => {
+  const caps = modelCapabilities.getModelCapabilities("gemini-2.5-flash-lite");
+  assert.equal(caps.vision, true);
+  assert.equal(caps.tools, true);
+  assert.equal(caps.reasoningEffort, true);
+});
+
+test("validateModelCapabilities: gemma + image throws 400", () => {
+  assert.throws(
+    () => modelCapabilities.validateModelCapabilities(
+      { model: "gemma-4-31b-it" },
+      { hasImages: true, hasTools: false, hasToolChoice: false, reasoningEffort: "" },
+      { stripReasoning: false }
+    ),
+    (err) => err.name === "ProviderRequestError" && err.code === "model_capability_mismatch" && err.status === 400
+  );
+});
+
+test("validateModelCapabilities: gemma + tools throws 400", () => {
+  assert.throws(
+    () => modelCapabilities.validateModelCapabilities(
+      { model: "gemma-4-31b-it" },
+      { hasImages: false, hasTools: true, hasToolChoice: false, reasoningEffort: "" },
+      { stripReasoning: false }
+    ),
+    (err) => err.name === "ProviderRequestError" && err.code === "model_capability_mismatch" && err.status === 400
+  );
+});
+
+test("validateModelCapabilities: gemma + tool_choice throws 400", () => {
+  assert.throws(
+    () => modelCapabilities.validateModelCapabilities(
+      { model: "gemma-4-31b-it" },
+      { hasImages: false, hasTools: false, hasToolChoice: true, reasoningEffort: "" },
+      { stripReasoning: false }
+    ),
+    (err) => err.name === "ProviderRequestError" && err.code === "model_capability_mismatch" && err.status === 400
+  );
+});
+
+test("validateModelCapabilities: gemma + reasoningEffort strips by default", () => {
+  const payload = { model: "gemma-4-31b-it", reasoning_effort: "high" };
+  modelCapabilities.validateModelCapabilities(
+    payload,
+    { hasImages: false, hasTools: false, hasToolChoice: false, reasoningEffort: "high" },
+    { stripReasoning: true }
+  );
+  // Should have stripped reasoning_effort
+  assert.equal(payload.reasoning_effort, undefined);
+});
+
+test("validateModelCapabilities: gemma + reasoningEffort throws when stripReasoning is false", () => {
+  assert.throws(
+    () => modelCapabilities.validateModelCapabilities(
+      { model: "gemma-4-31b-it", reasoning_effort: "high" },
+      { hasImages: false, hasTools: false, hasToolChoice: false, reasoningEffort: "high" },
+      { stripReasoning: false }
+    ),
+    (err) => err.name === "ProviderRequestError" && err.code === "model_capability_mismatch"
+  );
+});
+
+test("validateModelCapabilities: gemini-flash-latest + image + tools + reasoning is allowed", () => {
+  const payload = { model: "gemini-flash-latest", reasoning_effort: "high" };
+  modelCapabilities.validateModelCapabilities(
+    payload,
+    { hasImages: true, hasTools: true, hasToolChoice: true, reasoningEffort: "high" },
+    { stripReasoning: false }
+  );
+  assert.equal(payload.reasoning_effort, "high");
+});
+
+test("validateModelCapabilities: gemma with env overrides allows features", () => {
+  const originalAllowVision = process.env.GEMMA_ALLOW_VISION;
+  const originalAllowTools = process.env.GEMMA_ALLOW_TOOLS;
+  const originalAllowRE = process.env.GEMMA_ALLOW_REASONING_EFFORT;
+  process.env.GEMMA_ALLOW_VISION = "true";
+  process.env.GEMMA_ALLOW_TOOLS = "true";
+  process.env.GEMMA_ALLOW_REASONING_EFFORT = "true";
+
+  try {
+    const caps = modelCapabilities.getModelCapabilities("gemma-4-31b-it");
+    assert.equal(caps.vision, true);
+    assert.equal(caps.tools, true);
+    assert.equal(caps.reasoningEffort, true);
+  } finally {
+    process.env.GEMMA_ALLOW_VISION = originalAllowVision;
+    process.env.GEMMA_ALLOW_TOOLS = originalAllowTools;
+    process.env.GEMMA_ALLOW_REASONING_EFFORT = originalAllowRE;
+  }
+});
+
+// =============================================================================
+// /debug/model-capabilities endpoint tests
+// =============================================================================
+
+test("/debug/model-capabilities returns capabilities and settings", async () => {
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    const response = await fetch(`http://127.0.0.1:${port}/debug/model-capabilities`, {
+      headers: { authorization: "Bearer local-test-key" },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.ok(body.models, "expected models key");
+    assert.ok(body.models["gemini-flash-latest"]);
+    assert.equal(body.models["gemini-flash-latest"].vision, true);
+    assert.equal(body.models["gemma-4-31b-it"].vision, false);
+    assert.ok("unknownModelCapabilityMode" in body);
+    assert.ok("gemmaOverrides" in body);
+    assert.equal(body.gemmaOverrides.allowVision, false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("/debug/model-capabilities?model= returns single model info", async () => {
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    const response = await fetch(
+      `http://127.0.0.1:${port}/debug/model-capabilities?model=gemma-4-31b-it`,
+      { headers: { authorization: "Bearer local-test-key" } }
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.ok(body.singleModel);
+    assert.equal(body.singleModel.model, "gemma-4-31b-it");
+    assert.equal(body.singleModel.capabilities.vision, false);
+    assert.equal(body.singleModel.capabilities.tools, false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("/debug/model-capabilities returns 401 without auth", async () => {
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    const response = await fetch(`http://127.0.0.1:${port}/debug/model-capabilities`);
+    assert.equal(response.status, 401);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("/debug/model-capabilities does not expose API keys", async () => {
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    const response = await fetch(`http://127.0.0.1:${port}/debug/model-capabilities`, {
+      headers: { authorization: "Bearer local-test-key" },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    const text = JSON.stringify(body);
+    assert.equal(text.includes("test-key"), false);
+    assert.equal(text.includes("Bearer"), false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+// =============================================================================
+// Logging safety tests
+// =============================================================================
+
+test("getUpstreamErrorSnippet: does not include full base64 or prompt text", () => {
+  const snippet = logging.getUpstreamErrorSnippet({
+    error: {
+      message: "Something went wrong",
+      details: "iVBORw0KGgo= some base64 here. User asked about something secret.",
+    },
+  });
+  // The snippet should be limited to error message, not the full payload
+  const parsed = JSON.parse(snippet);
+  assert.ok(parsed.error.message);
+  assert.equal(parsed.error.message.includes("secret"), false);
+});
+
+test("getUpstreamErrorSnippet: limits snippet length", () => {
+  const longMessage = "x".repeat(5000);
+  const snippet = logging.getUpstreamErrorSnippet({
+    error: { message: longMessage },
+  });
+  const parsed = JSON.parse(snippet);
+  assert.ok(parsed.error.message.length <= 2000);
+});
+
+// =============================================================================
+// Integration: gemma + image returns local 400
+// =============================================================================
+
+test("/v1/chat/completions: gemma + image returns local 400 before upstream", async () => {
+  let upstreamCalled = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (typeof url === "string" && url.includes("generativelanguage.googleapis.com")) {
+      upstreamCalled = true;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return originalFetch(url, init);
+  };
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer" },
+      body: JSON.stringify({
+        model: "gemma-4-31b-it",
+        stream: false,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "What is in this image?" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+          ],
+        }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.error.code, "model_capability_mismatch");
+    assert.ok(body.error.message.includes("vision"));
+    assert.equal(upstreamCalled, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+// =============================================================================
+// Integration: repeated 500 stops failover (fingerprint guard unit + partial integration)
+// =============================================================================
+
+test("/v1/chat/completions: repeated 500 is not retried infinitely (classification is applied)", async () => {
+  const { fingerprintTracker } = mod;
+  fingerprintTracker.clear();
+
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  globalThis.fetch = async (url, init) => {
+    if (typeof url === "string" && url.includes("generativelanguage.googleapis.com")) {
+      callCount++;
+      return new Response(
+        JSON.stringify({ error: { message: "Internal error" } }),
+        { status: 500, headers: { "content-type": "application/json" } }
+      );
+    }
+    return originalFetch(url, init);
+  };
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer" },
+      body: JSON.stringify({
+        model: "gemini-flash-latest",
+        stream: false,
+        messages: [{ role: "user", content: "Hello" }],
+      }),
+    });
+    // With 1 key, after the key cooldowns from 500, no more keys available
+    // The response should be 503 (all keys exhausted)
+    const body = await response.json();
+    assert.ok(response.status === 503 || body.error.code === "all_keys_exhausted",
+      `Expected 503 or all_keys_exhausted, got status=${response.status} code=${body.error?.code}`);
+    // The upstream was only called once (single key available)
+    assert.equal(callCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("fingerprintTracker: integration with classifyUpstreamError stops repeated same-payload 500s", () => {
+  const tracker = upstreamErrors.createFingerprintTracker({ maxAttempts: 2, ttlMs: 300000 });
+
+  // Build a shape that looks like the problem request
+  const shape = upstreamErrors.buildRequestShape({
+    model: "gemma-4-31b-it",
+    stream: true,
+    tools: [{ type: "function", function: { name: "search" } }],
+    tool_choice: "auto",
+    reasoning_effort: "high",
+  }, [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "What is in this image?" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+      ],
+    },
+  ]);
+
+  const fp = upstreamErrors.createRequestFingerprint(shape);
+
+  // Simulate first key getting a 500
+  const c1 = upstreamErrors.classifyUpstreamError(500, { error: { message: "Internal error" } }, shape);
+  assert.equal(c1.kind, "payload_or_model");
+
+  tracker.recordAttempt(fp, 1, c1);
+  assert.equal(tracker.isBlocked(fp), false);
+
+  // Second key also gets 500 -> blocked
+  const c2 = upstreamErrors.classifyUpstreamError(500, { error: { message: "Internal error" } }, shape);
+  tracker.recordAttempt(fp, 2, c2);
+  assert.equal(tracker.isBlocked(fp), true);
+
+  // Verify tracker entry has both attempts
+  const entry = tracker.get(fp);
+  assert.equal(entry.attempts.length, 2);
+  assert.equal(entry.attempts[0].keyIndex, 1);
+  assert.equal(entry.attempts[1].keyIndex, 2);
+});
+
+// =============================================================================
+// Integration: gemini-flash-latest + image is allowed
+// =============================================================================
+
+test("/v1/chat/completions: gemini-flash-latest + image + tools is allowed", async () => {
+  let upstreamPayload = null;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (typeof url === "string" && url.includes("generativelanguage.googleapis.com")) {
+      upstreamPayload = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({
+          choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+    return originalFetch(url, init);
+  };
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer" },
+      body: JSON.stringify({
+        model: "gemini-flash-latest",
+        stream: false,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+          ],
+        }],
+        tools: [{ type: "function", function: { name: "search" } }],
+        tool_choice: "auto",
+        reasoning_effort: "high",
+      }),
+    });
+    assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
     await new Promise((resolve) => server.close(resolve));
   }
 });

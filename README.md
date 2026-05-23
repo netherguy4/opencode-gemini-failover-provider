@@ -476,6 +476,47 @@ HOST=127.0.0.1
 - File size limits are enforced: `MAX_IMAGE_BYTES` (20 MB default), `MAX_FILE_BYTES` (50 MB default), `MAX_TOTAL_ATTACHMENT_BYTES` (100 MB default).
 - `MAX_REQUEST_BODY_BYTES` (100 MB default) prevents memory exhaustion from oversized requests.
 
+## Upstream 500 handling
+
+The proxy distinguishes provider transient errors from likely model/payload incompatibilities.
+It will not burn every API key on repeated same-payload 500s.
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `upstream_model_payload_error` | Unsupported model/capability combo | Use Gemini Flash, disable images/tools/reasoning, or enable capability override |
+| Repeated 429 | quota/rate limit | Add quota, wait cooldown, reduce request rate |
+| Gemma fails with images/tools | Gemma capability mismatch | Use Gemini model or opt in with env flags after testing |
+
+## Troubleshooting
+
+#### `model_capability_mismatch` (400)
+
+The request uses a model with features it doesn't support. For example, `gemma-4-31b-it` does not support images, tools, or reasoning effort by default.
+
+Fix:
+- Switch to a Gemini Flash model (`gemini-flash-latest`, `gemini-3.1-flash-lite`)
+- Or disable images/tools/reasoning in your client
+- Or override: `GEMMA_ALLOW_VISION=true`, `GEMMA_ALLOW_TOOLS=true`, `GEMMA_ALLOW_REASONING_EFFORT=true`
+
+#### `upstream_model_payload_error` (502)
+
+The upstream returned repeated 500s for the same request shape across multiple keys. The proxy stops retrying to avoid burning all keys.
+
+Fix:
+- Check if the model supports all requested features (images, tools, reasoning)
+- Try a different model
+- Increase `MAX_UPSTREAM_500_FAILOVER_ATTEMPTS` if you want more retries
+
+#### Debugging model capabilities
+
+```bash
+# List all known model capabilities
+curl -s http://127.0.0.1:8787/debug/model-capabilities | jq
+
+# Check a specific model
+curl -s "http://127.0.0.1:8787/debug/model-capabilities?model=gemma-4-31b-it" | jq
+```
+
 ## License
 
 [MIT](./LICENSE)
