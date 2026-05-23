@@ -2,6 +2,26 @@
 
 A local OpenAI-compatible proxy that forwards `/v1/chat/completions` to the Gemini OpenAI-compatible endpoint and rotates across multiple Gemini API keys on auth, billing, quota, and transient errors. Also exposes a minimal Ollama-compatible API so VS Code's GitHub Copilot Chat can use Gemini as a BYOK model.
 
+Supports text, tool/function calling, images/vision, and common document attachments (PDF, DOCX, XLSX, TXT, MD, JSON, CSV, HTML).
+
+## Feature matrix
+
+| Feature | Status |
+| --- | --- |
+| Text chat | Supported |
+| Tools / function calling | Supported |
+| Streaming (SSE / NDJSON) | Supported |
+| Images via OpenAI `image_url` | Supported (PNG, JPEG, WebP, GIF) |
+| Images via Ollama `images[]` | Supported |
+| PDF | Supported via text extraction |
+| DOCX | Supported via text extraction |
+| XLSX | Supported via sheet extraction |
+| TXT, MD, JSON, CSV | Supported (injected as text) |
+| HTML | Supported (tags stripped) |
+| Audio / video | Unsupported (returns clear error) |
+| Remote file URLs | Disabled by default (security) |
+| Native Gemini Files API | Disabled by default |
+
 ## What it does and what it doesn't
 
 This proxy is meant to improve reliability, not to bypass per-key limits.
@@ -11,6 +31,9 @@ This proxy is meant to improve reliability, not to bypass per-key limits.
 - Puts a key on cooldown after `429`, `5xx`, or timeout.
 - Disables a key after `401`. `403` goes on cooldown.
 - Does not retry ordinary `400` responses (bad request, unsupported model, etc.).
+- Extracts text from file attachments locally and injects it into the prompt.
+- Validates image and file sizes; rejects oversized/unsupported attachments with clear errors.
+- Never silently drops user-provided attachments.
 
 ## Quick start (Docker)
 
@@ -70,6 +93,20 @@ All settings come from `.env`. See `.env.example` for the full set.
 | `THOUGHT_SIGNATURE_DUMMY_FALLBACK` | `true` | If a Gemini `thought_signature` is missing, inject Google's documented dummy value. |
 | `THOUGHT_SIGNATURE_CACHE_TTL_MS` | `1800000` | TTL for cached thought signatures. |
 | `THOUGHT_SIGNATURE_CACHE_MAX_ENTRIES` | `10000` | Max entries in the thought-signature cache. |
+| `DEBUG_REQUEST_SHAPES` | `false` | Log request metadata (route, model, attachment counts/types). |
+| `DEBUG_NORMALIZED_PAYLOADS` | `false` | Log normalized payload structure (content shapes, image sizes). |
+| `DEBUG_UPSTREAM_MODEL_VERSION` | `false` | Enable `GET /debug/model-version` endpoint. |
+| `ENABLE_VISION` | `true` | Enable image/vision processing. |
+| `ADVERTISE_VISION` | `true` | Advertise `vision` capability in `/api/show`. |
+| `ENABLE_FILE_TEXT_EXTRACTION` | `true` | Enable text extraction from file attachments. |
+| `ENABLE_REMOTE_FILE_FETCH` | `false` | Enable remote file URL fetching (security risk). |
+| `ENABLE_NATIVE_GEMINI_FILES` | `false` | Enable native Gemini Files API path (experimental). |
+| `MAX_REQUEST_BODY_BYTES` | `104857600` | Max request body size (100 MB). |
+| `MAX_IMAGE_BYTES` | `20971520` | Max per-image attachment size (20 MB). |
+| `MAX_FILE_BYTES` | `52428800` | Max per-file attachment size (50 MB). |
+| `MAX_TOTAL_ATTACHMENT_BYTES` | `104857600` | Max combined attachment size (100 MB). |
+| `FILE_TEXT_MAX_CHARS` | `200000` | Max characters of extracted file text. |
+| `REMOTE_FETCH_TIMEOUT_MS` | `10000` | Timeout for remote file fetching. |
 
 Notes:
 
@@ -94,8 +131,6 @@ http://127.0.0.1:8787/v1
 http://127.0.0.1:8787
 ```
 
-If you see `Not found: POST /chat/completions`, you're running an old container — rebuild with `docker compose up -d --build`.
-
 ### Payload normalization
 
 OpenCode can send extra top-level fields that Gemini's `/chat/completions` rejects (for example `instructions`, producing `Invalid JSON payload received. Unknown name "instructions"...`). The proxy normalizes the payload before forwarding:
@@ -104,18 +139,142 @@ OpenCode can send extra top-level fields that Gemini's `/chat/completions` rejec
 - `developer` role → `system`.
 - Unknown top-level fields that Gemini rejects are stripped.
 - Standard fields (`messages`, `tools`, `tool_choice`, `temperature`, `stream`, `max_tokens`, …) are preserved.
+- `image_url` and file attachment parts are validated, size-checked, and normalized.
+- File attachments are text-extracted and injected as text blocks.
 
 ### Gemini tool calling: `thought_signature`
 
-Gemini (especially Gemini 3) requires `thought_signature` to be echoed back in the next assistant tool-call message. If a client drops the nonstandard `extra_content` field, you get errors like `Function call is missing a thought_signature ...`.
-
-The proxy:
+Gemini (especially Gemini 3) requires `thought_signature` to be echoed back in the next assistant tool-call message. The proxy:
 
 - Caches `tool_calls[].extra_content.google.thought_signature` from Gemini responses.
 - Reattaches the signature to subsequent assistant `tool_calls` by `tool_call.id`.
 - Falls back to Google's documented `skip_thought_signature_validator` value if `THOUGHT_SIGNATURE_DUMMY_FALLBACK=true` and the cache is empty.
 
 Reference: [Thought signatures](https://ai.google.dev/gemini-api/docs/thought-signatures).
+
+### OpenAI-compatible examples
+
+#### Text chat
+
+```bash
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-dev-key" \
+  -d '{
+    "model": "gemini-flash-latest",
+    "messages": [{"role":"user","content":"Say hello in one sentence"}],
+    "stream": false
+  }'
+```
+
+#### Image (data URL)
+
+```bash
+IMAGE_B64="$(base64 -w0 test.png)"
+
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-dev-key" \
+  -d "{
+    \"model\": \"gemini-flash-latest\",
+    \"messages\": [{
+      \"role\": \"user\",
+      \"content\": [
+        {\"type\": \"text\", \"text\": \"Describe this image briefly.\"},
+        {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$IMAGE_B64\"}}
+      ]
+    }],
+    \"stream\": false
+  }" | jq
+```
+
+#### PDF as base64 file
+
+```bash
+PDF_B64="$(base64 -w0 sample.pdf)"
+
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-dev-key" \
+  -d "{
+    \"model\": \"gemini-flash-latest\",
+    \"messages\": [{
+      \"role\": \"user\",
+      \"content\": [
+        {\"type\": \"text\", \"text\": \"Summarize the attached PDF.\"},
+        {
+          \"type\": \"input_file\",
+          \"filename\": \"sample.pdf\",
+          \"mime_type\": \"application/pdf\",
+          \"base64\": \"$PDF_B64\"
+        }
+      ]
+    }],
+    \"stream\": false
+  }" | jq
+```
+
+## Ollama-compatible API surface
+
+Copilot Chat can use custom models through its **Ollama** provider. The proxy exposes a minimal Ollama-compatible API:
+
+```txt
+GET  /api/version    fake Ollama version
+GET  /api/tags       model list in Ollama schema
+POST /api/show       model capabilities (advertises completion, tools, vision)
+POST /api/chat       Ollama-native chat, NDJSON streaming
+```
+
+`/api/chat` translates the request body to OpenAI format, runs it through the same Gemini-key failover, and translates the response back to Ollama format (including `tool_calls`).
+
+### Copilot Chat BYOK / Ollama notes
+
+- `/api/show` advertises `vision` when `ADVERTISE_VISION=true`.
+- Copilot may or may not send attachments depending on its BYOK/Ollama implementation.
+- Inline completions do not use BYOK — only Chat and Edits/Agent modes.
+- If an API Key field is shown in Copilot, set it to your `LOCAL_PROVIDER_KEY`.
+
+### Ollama image example
+
+```bash
+IMAGE_B64="$(base64 -w0 test.png)"
+
+curl -s http://127.0.0.1:8787/api/chat \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"gemini-flash-latest:latest\",
+    \"stream\": false,
+    \"messages\": [{
+      \"role\": \"user\",
+      \"content\": \"Describe this image briefly.\",
+      \"images\": [\"$IMAGE_B64\"]
+    }]
+  }" | jq
+```
+
+### Expose to your LAN
+
+In `.env`:
+
+```env
+HOST=0.0.0.0
+PORT=8787
+PUBLISHED_HOST=0.0.0.0
+```
+
+Open `8787/tcp` in the firewall, then from a client machine:
+
+```bash
+curl http://<LAN_IP>:8787/api/version
+```
+
+### Configure Copilot Chat
+
+1. Open Copilot Chat → model picker → **Manage Models…** (or Command Palette: `Chat: Manage Language Models`).
+2. **Add Models…** → **Ollama**.
+3. URL: `http://<LAN_IP>:8787` (no `/v1` — the Ollama client targets `/api/*` itself).
+4. If an API Key field is shown, set it to your `LOCAL_PROVIDER_KEY`. If there's no field, leave it blank.
+5. Pick a model from the list, e.g. `gemini-flash-latest:latest` or one of the reasoning variants like `gemini-flash-latest-medium:latest`.
 
 ## Try a chat completion
 
@@ -200,69 +359,6 @@ For Gemini 2.5 Flash, `none` is also available (`gemini-local/gemini-2.5-flash-n
 
 The proxy accepts both `reasoningEffort` (OpenCode-style) and `reasoning_effort` (OpenAI-style).
 
-## VS Code · GitHub Copilot Chat (Ollama BYOK)
-
-Copilot Chat can use custom models through its **Ollama** provider. The proxy exposes a minimal Ollama-compatible API alongside the OpenAI endpoints:
-
-```txt
-GET  /api/version    fake Ollama version, satisfies Copilot's check
-GET  /api/tags       model list in Ollama schema (with :latest suffix)
-POST /api/show       model capabilities (advertises tools)
-POST /api/chat       Ollama-native chat, NDJSON streaming
-```
-
-`/api/chat` translates the request body to OpenAI format, runs it through the same Gemini-key failover, and translates the response back to Ollama format (including `tool_calls`).
-
-### Expose to your LAN
-
-In `.env`:
-
-```env
-HOST=0.0.0.0
-PORT=8787
-PUBLISHED_HOST=0.0.0.0
-```
-
-Open `8787/tcp` in the firewall and start the proxy:
-
-```bash
-docker compose up -d --build
-```
-
-From a client machine:
-
-```bash
-curl http://<LAN_IP>:8787/api/version
-# {"version":"0.11.0"}
-```
-
-### Configure Copilot Chat
-
-1. Open Copilot Chat → model picker → **Manage Models…** (or Command Palette: `Chat: Manage Language Models`).
-2. **Add Models…** → **Ollama**.
-3. URL: `http://<LAN_IP>:8787` (no `/v1` — the Ollama client targets `/api/*` itself).
-4. If an API Key field is shown, set it to your `LOCAL_PROVIDER_KEY`. If there's no field, leave it blank — the shim allows unauthenticated requests; rely on firewall rules.
-5. Pick a model from the list, e.g. `gemini-flash-latest:latest` or one of the reasoning variants like `gemini-flash-latest-medium:latest`.
-
-### Known limitations
-
-- Copilot **inline completions** don't use BYOK — those are pinned to Copilot's own models. Only Chat and Edits/Agent modes use the configured provider.
-- Vision (`images`) is not advertised in `capabilities`. If Copilot Chat sends images, the proxy forwards them, but Gemini may reject the request unless the selected model supports image input.
-
-## Running without Docker
-
-```bash
-npm install
-cp .env.example .env
-npm start
-```
-
-For non-Docker runs, prefer:
-
-```env
-HOST=127.0.0.1
-```
-
 ## Reasoning / thinking level
 
 Control Gemini thinking via env:
@@ -322,11 +418,63 @@ If a client keeps sending the wrong model, force the override:
 FORCE_DEFAULT_MODEL=true
 ```
 
+## Debugging / troubleshooting
+
+### Check if the client is sending images/files
+
+Set `DEBUG_REQUEST_SHAPES=true` in `.env` and check logs:
+
+```bash
+docker compose logs -f | grep debug-request-shape
+```
+
+Output shows for each request: route, model, message count, and per-message: role, content type, text part count, image part count, file part count, attachment MIME types, attachment byte sizes. Full prompts and base64 data are never logged.
+
+### Check normalized payloads
+
+Set `DEBUG_NORMALIZED_PAYLOADS=true` for more detail on the payload sent upstream.
+
+### Check which model version Gemini resolves
+
+Set `DEBUG_UPSTREAM_MODEL_VERSION=true` and query:
+
+```bash
+curl -s "http://127.0.0.1:8787/debug/model-version?model=gemini-flash-latest" \
+  -H "Authorization: Bearer local-dev-key" | jq
+```
+
+### Error: "Unsupported attachment type"
+
+The client sent a file type the proxy doesn't understand (e.g. `.zip`, `.mp4`). Check the error message for supported types. If the file type should be supported, check that `ENABLE_FILE_TEXT_EXTRACTION=true`.
+
+### Error: "attachment too large"
+
+Increase `MAX_FILE_BYTES`, `MAX_IMAGE_BYTES`, or `MAX_TOTAL_ATTACHMENT_BYTES` in `.env`.
+
+### Running without Docker
+
+```bash
+npm install
+cp .env.example .env
+npm start
+```
+
+For non-Docker runs, prefer:
+
+```env
+HOST=127.0.0.1
+```
+
 ## Security notes
 
 - `.env` is gitignored — keep it that way. Never commit real keys.
-- With `PUBLISHED_HOST=0.0.0.0`, the proxy is reachable from your LAN. The Ollama API surface allows unauthenticated requests by design (Copilot Chat doesn't always send a key), so restrict `8787/tcp` at the firewall to known clients, or keep `LOCAL_PROVIDER_KEY` set and make sure your clients send it.
+- Debug logging (`DEBUG_REQUEST_SHAPES`, `DEBUG_NORMALIZED_PAYLOADS`) never logs full prompts, file contents, or base64 data. It logs only metadata: attachment counts, types, and byte sizes.
+- Remote file URL fetching is **disabled by default** (`ENABLE_REMOTE_FILE_FETCH=false`). Remote URLs return a clear error.
+- With `PUBLISHED_HOST=0.0.0.0`, the proxy is reachable from your LAN. Restrict `8787/tcp` at the firewall.
+- The Ollama API surface allows unauthenticated requests by design (Copilot Chat doesn't always send a key). Rely on firewall rules if running on a LAN.
 - The OpenAI surface (`/v1/chat/completions` and `/chat/completions`) always requires `Authorization: Bearer $LOCAL_PROVIDER_KEY`.
+- File size limits are enforced: `MAX_IMAGE_BYTES` (20 MB default), `MAX_FILE_BYTES` (50 MB default), `MAX_TOTAL_ATTACHMENT_BYTES` (100 MB default).
+- `MAX_REQUEST_BODY_BYTES` (100 MB default) prevents memory exhaustion from oversized requests.
 
 ## License
 

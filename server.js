@@ -1,23 +1,47 @@
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import { config } from "./src/config.js";
+import {
+  logRequestStart,
+  logUpstreamOk,
+  logUpstreamFail,
+  logNetworkError,
+  logKeyDisabled,
+  logKeyCooldown,
+  logStreamEnd,
+  logOllamaStreamEnd,
+  logStartup,
+  logDebugRequestShape,
+  logDebugNormalizedPayload,
+} from "./src/logging.js";
+import {
+  buildUpstreamContent,
+  ollamaImagesToParts,
+  MultimodalError,
+  normalizeContent,
+} from "./src/multimodal.js";
 
 const GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai";
+const GEMINI_GENERATE_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+
+const {
+  host,
+  port,
+  localProviderKey,
+  defaultModel,
+  forceDefaultModel,
+  defaultReasoningEffort,
+  forceReasoningEffort,
+  maxAttemptsPerRequest,
+  keyCooldownMs,
+  upstreamTimeoutMs,
+  thoughtSignatureDummyFallback,
+  thoughtSignatureCacheTtlMs,
+  thoughtSignatureCacheMaxEntries,
+} = config;
 
 const env = process.env;
-const host = env.HOST || "127.0.0.1";
-const port = Number(env.PORT || 8787);
-const localProviderKey = env.LOCAL_PROVIDER_KEY || "";
-const defaultModel = env.DEFAULT_MODEL || "gemini-flash-latest";
-const forceDefaultModel = String(env.FORCE_DEFAULT_MODEL || "false").toLowerCase() === "true";
-const defaultReasoningEffort = (env.REASONING_EFFORT || "").trim().toLowerCase();
-const forceReasoningEffort = String(env.FORCE_REASONING_EFFORT || "false").toLowerCase() === "true";
-const maxAttemptsPerRequest = Math.max(1, Number(env.MAX_ATTEMPTS_PER_REQUEST || 3));
-const keyCooldownMs = Math.max(1000, Number(env.KEY_COOLDOWN_MS || 60_000));
-const upstreamTimeoutMs = Math.max(10_000, Number(env.UPSTREAM_TIMEOUT_MS || 300_000));
-const thoughtSignatureDummyFallback = String(env.THOUGHT_SIGNATURE_DUMMY_FALLBACK || "true").toLowerCase() === "true";
-const thoughtSignatureCacheTtlMs = Math.max(1000, Number(env.THOUGHT_SIGNATURE_CACHE_TTL_MS || 1_800_000));
-const thoughtSignatureCacheMaxEntries = Math.max(1, Number(env.THOUGHT_SIGNATURE_CACHE_MAX_ENTRIES || 10_000));
 
 const keys = (env.GEMINI_API_KEYS || "")
   .split(",")
@@ -121,7 +145,7 @@ function readJsonBody(req) {
     req.setEncoding("utf8");
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 100 * 1024 * 1024) {
+      if (body.length > config.maxRequestBodyBytes) {
         reject(new Error("Request body is too large"));
         req.destroy();
       }
@@ -149,10 +173,6 @@ function sendJson(res, status, value) {
 function isAuthorized(req) {
   if (!localProviderKey) return true;
   const auth = req.headers.authorization || "";
-  // Soft auth: treat missing or empty-token Bearer as "no key provided".
-  // VS Code Copilot Chat 0.48.x's Ollama BYOK sends `Authorization: Bearer` with
-  // an empty token because that provider has no API key field. Real Ollama
-  // clients also typically don't authenticate.
   if (!auth) return true;
   const token = auth.replace(/^Bearer\s*/i, "").trim();
   if (!token) return true;
@@ -170,8 +190,6 @@ function retryAfterMs(headers) {
 }
 
 function shouldFailover(status, errorPayload) {
-  // Failover only on key/provider/billing/quota/transient errors.
-  // Do not retry normal client errors like bad request, safety block, unsupported model, etc.
   if ([401, 402, 403, 408, 409, 429, 500, 502, 503, 504].includes(status)) return true;
 
   const text = JSON.stringify(errorPayload || {}).toLowerCase();
@@ -208,11 +226,12 @@ function stringifyInstruction(value) {
   return String(value);
 }
 
-function normalizeContent(content) {
+// Legacy sync normalizeContent - preserves backward compatibility for exports/tests.
+// For the full multimodal pipeline, use buildUpstreamContent from src/multimodal.js.
+function normalizeContentLegacy(content) {
   if (content == null) return "";
   if (typeof content === "string") return content;
 
-  // Keep OpenAI-style multimodal parts, but remove extra fields that Gemini may reject.
   if (Array.isArray(content)) {
     return content
       .map((part) => {
@@ -222,8 +241,6 @@ function normalizeContent(content) {
         if (part.type === "text") return { type: "text", text: part.text || "" };
         if (part.type === "image_url") return { type: "image_url", image_url: part.image_url };
 
-        // Some clients emit { type: "input_text" } / { type: "input_image" }.
-        // Convert the text form and drop unsupported binary/file parts for chat/completions.
         if (part.type === "input_text") return { type: "text", text: part.text || "" };
         if (part.type === "input_image" && part.image_url) {
           return { type: "image_url", image_url: part.image_url };
@@ -250,7 +267,46 @@ function normalizeMessages(messages, instructions) {
 
     const next = {
       role: message.role === "developer" ? "system" : message.role,
-      content: normalizeContent(message.content),
+      content: normalizeContentLegacy(message.content),
+    };
+
+    if (message.name) next.name = message.name;
+    if (message.tool_call_id) next.tool_call_id = message.tool_call_id;
+    if (Array.isArray(message.tool_calls)) {
+      next.tool_calls = repairToolCalls(message.tool_calls);
+    }
+
+    out.push(next);
+  }
+
+  return out;
+}
+
+// Async multimodal content processing for request handlers.
+// Processes all messages and handles file extraction.
+async function normalizeMessagesMultimodal(messages, instructions) {
+  const out = [];
+  const instructionText = stringifyInstruction(instructions);
+
+  if (instructionText) {
+    out.push({ role: "system", content: instructionText });
+  }
+
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!message || typeof message !== "object") continue;
+
+    let content;
+    try {
+      const result = await buildUpstreamContent(message.content, config.enableFileTextExtraction);
+      content = result.openAiContent;
+    } catch (e) {
+      if (e instanceof MultimodalError) throw e;
+      throw e;
+    }
+
+    const next = {
+      role: message.role === "developer" ? "system" : message.role,
+      content,
     };
 
     if (message.name) next.name = message.name;
@@ -302,7 +358,6 @@ function repairToolCalls(toolCalls) {
 
     cacheThoughtSignature(toolCall);
 
-    // Gemini expects thought_signature on the first tool call of the message.
     if (index !== 0) return toolCall;
 
     const existing = readThoughtSignatureFromToolCall(toolCall);
@@ -338,20 +393,14 @@ const ALLOWED_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "
 const MODEL_BASES = [
   "gemini-flash-latest",
   "gemini-3-flash-preview",
-  "gemini-3.1-flash-lite",
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
 ];
 
 function normalizeRequestedModel(rawModel) {
-  // Strip Ollama-style ":latest" / ":tag" suffix — Copilot Chat's Ollama BYOK
-  // sends model names like "gemini-flash-latest-high:latest" to /v1/chat/completions.
   let model = stripModelTag(rawModel || defaultModel);
   let effortFromModel = undefined;
 
-  // Optional convenience model ids for clients that cannot display variants well:
-  //   gemini-flash-latest-minimal -> model=gemini-flash-latest, reasoning_effort=minimal
-  //   gemini-2.5-flash-none      -> model=gemini-2.5-flash, reasoning_effort=none
   for (const base of MODEL_BASES) {
     for (const effort of ALLOWED_REASONING_EFFORTS) {
       const suffix = `-${effort}`;
@@ -365,9 +414,6 @@ function normalizeRequestedModel(rawModel) {
 }
 
 function normalizeReasoningEffort(payload, effortFromModel) {
-  // Gemini OpenAI-compatible chat/completions accepts OpenAI-style
-  // `reasoning_effort`: none|minimal|low|medium|high.
-  // OpenCode config uses camelCase `reasoningEffort`; accept both.
   const allowed = ALLOWED_REASONING_EFFORTS;
 
   let incoming = payload.reasoning_effort || payload.reasoningEffort || effortFromModel;
@@ -394,10 +440,6 @@ function normalizeReasoningEffort(payload, effortFromModel) {
 }
 
 function normalizePayload(payload) {
-  // Gemini's OpenAI-compatible chat endpoint is stricter than OpenAI's SDK types.
-  // OpenCode / AI SDK may send top-level fields like `instructions`; Gemini rejects
-  // them with: "Unknown name \"instructions\": Cannot find field.".
-  // So we convert what is useful and forward only common chat.completions fields.
   const next = {};
 
   const requested = normalizeRequestedModel(payload.model);
@@ -408,7 +450,6 @@ function normalizePayload(payload) {
 
   if (forceDefaultModel || !next.model || next.model === "gemini-flash") {
     next.model = fallback.model;
-    // Preserve effort selected by a convenience model id unless the env explicitly forces it.
     effortFromModel = effortFromModel || fallback.effortFromModel;
   }
 
@@ -443,6 +484,13 @@ function normalizePayload(payload) {
   return next;
 }
 
+// Applies multimodal normalization to a normalized payload (async).
+// This processes content arrays through buildUpstreamContent for images/files.
+async function applyMultimodalNormalization(payload, originalMessages) {
+  payload.messages = await normalizeMessagesMultimodal(originalMessages || payload.messages, undefined);
+  return payload;
+}
+
 async function upstreamChatCompletion(payload, streamMode) {
   const attemptsLimit = Math.min(maxAttemptsPerRequest, keyState.length);
   const errors = [];
@@ -474,7 +522,7 @@ async function upstreamChatCompletion(payload, streamMode) {
       clearTimeout(timeout);
 
       if (response.ok) {
-        console.log(`[ok] key=${key.index + 1}/${keyState.length} ${maskKey(key.key)} model=${payload.model} stream=${streamMode}`);
+        logUpstreamOk(key.index + 1, keyState.length, maskKey(key.key), payload.model, streamMode);
         return { response, key };
       }
 
@@ -483,7 +531,7 @@ async function upstreamChatCompletion(payload, streamMode) {
       key.lastError = `${response.status}: ${message}`;
       errors.push({ key: key.index + 1, status: response.status, message });
 
-      console.warn(`[fail] key=${key.index + 1}/${keyState.length} status=${response.status} ${message}`);
+      logUpstreamFail(key.index + 1, keyState.length, response.status, message);
 
       if (!shouldFailover(response.status, errorPayload)) {
         return { response: null, errorStatus: response.status, errorPayload };
@@ -495,7 +543,7 @@ async function upstreamChatCompletion(payload, streamMode) {
       key.lastError = e.message;
       key.cooldownUntil = now() + keyCooldownMs;
       errors.push({ key: key.index + 1, status: "network", message: e.message });
-      console.warn(`[network] key=${key.index + 1}/${keyState.length} ${e.message}`);
+      logNetworkError(key.index + 1, keyState.length, e.message);
     }
   }
 
@@ -516,13 +564,13 @@ function applyKeyFailureState(key, status, headers, defaultCooldownMs) {
 
   if (status === 401) {
     key.disabled = true;
-    console.warn(`[disabled] key=${key.index + 1}/${totalKeysForLog} ${maskKey(key.key)}`);
+    logKeyDisabled(key.index + 1, totalKeysForLog, maskKey(key.key));
     return;
   }
 
   const cooldownMs = retryAfterMs(headers) || defaultCooldownMs;
   key.cooldownUntil = now() + Math.max(defaultCooldownMs, cooldownMs);
-  console.warn(`[cooldown] key=${key.index + 1}/${totalKeysForLog} until=${new Date(key.cooldownUntil).toISOString()}`);
+  logKeyCooldown(key.index + 1, totalKeysForLog, key.cooldownUntil);
 }
 
 async function handleChatCompletions(req, res) {
@@ -531,13 +579,35 @@ async function handleChatCompletions(req, res) {
   }
 
   let payload;
+  let rawBody;
   try {
-    payload = normalizePayload(await readJsonBody(req));
+    rawBody = await readJsonBody(req);
+    payload = normalizePayload(rawBody);
   } catch (e) {
     return sendJson(res, 400, { error: { message: e.message } });
   }
 
   const streamMode = payload.stream === true;
+
+  // Apply multimodal normalization (async — may extract files)
+  try {
+    await applyMultimodalNormalization(payload, rawBody.messages);
+  } catch (e) {
+    if (e instanceof MultimodalError) {
+      return sendJson(res, e.status || 400, {
+        error: { message: e.message, code: e.code, details: e.details },
+      });
+    }
+    return sendJson(res, 400, { error: { message: e.message } });
+  }
+
+  // Debug logging
+  const requestedModel = rawBody.model || defaultModel;
+  logDebugRequestShape("/v1/chat/completions", streamMode, requestedModel, payload.model, payload);
+  if (config.debugNormalizedPayloads) {
+    logDebugNormalizedPayload(payload);
+  }
+
   const result = await upstreamChatCompletion(payload, streamMode);
 
   if (!result.response) {
@@ -547,7 +617,6 @@ async function handleChatCompletions(req, res) {
   const upstream = result.response;
   const headers = Object.fromEntries(upstream.headers.entries());
 
-  // Avoid forwarding hop-by-hop/problematic headers.
   delete headers["content-encoding"];
   delete headers["content-length"];
   delete headers["transfer-encoding"];
@@ -605,7 +674,7 @@ async function handleChatCompletions(req, res) {
       }
     }
   } catch (e) {
-    console.warn(`[stream] client/upstream stream ended: ${e.message}`);
+    logStreamEnd(e.message);
   } finally {
     res.end();
   }
@@ -648,12 +717,6 @@ function handleHealth(req, res) {
 
 // =============================================================================
 // Ollama-compatible API surface
-//
-// GitHub Copilot Chat's "Ollama" BYOK provider verifies the server with native
-// Ollama endpoints (`/api/version`, `/api/tags`, `/api/show`) and sends chat
-// requests in Ollama format on `/api/chat` — not on `/v1/chat/completions`.
-// These handlers translate Ollama requests/responses to the existing failover
-// pipeline that targets Gemini's OpenAI-compatible endpoint.
 // =============================================================================
 
 const OLLAMA_FAKE_VERSION = "0.11.0";
@@ -723,17 +786,29 @@ async function handleOllamaShow(req, res) {
     return sendJson(res, 400, { error: e.message });
   }
   const name = stripModelTag(body?.model || body?.name || defaultModel);
+
+  const capabilities = ["completion", "tools"];
+  if (config.advertiseVision) {
+    capabilities.push("vision");
+  }
+
+  const modelInfo = {
+    "general.architecture": "gemini",
+    "general.parameter_count": 0,
+    "gemini.context_length": 1048576,
+  };
+  if (config.advertiseVision) {
+    modelInfo["gemini.vision"] = true;
+    modelInfo["gemini.image_input"] = true;
+  }
+
   sendJson(res, 200, {
     modelfile: "",
     parameters: "",
     template: "",
     details: ollamaModelEntry(name).details,
-    model_info: {
-      "general.architecture": "gemini",
-      "general.parameter_count": 0,
-      "gemini.context_length": 1048576,
-    },
-    capabilities: ["completion", "tools"],
+    model_info: modelInfo,
+    capabilities,
   });
 }
 
@@ -836,15 +911,37 @@ async function handleOllamaChat(req, res) {
 
   const requestedModel = String(body.model || defaultModel);
   const cleanModel = stripModelTag(requestedModel);
-  const streamMode = body.stream !== false; // Ollama default is stream=true
+  const streamMode = body.stream !== false;
+
+  const openAiMessages = ollamaMessagesToOpenAI(body.messages);
+  const openAiTools = ollamaToolsToOpenAI(body.tools);
+  const ollamaOpts = ollamaOptionsToOpenAI(body.options);
 
   const openAiPayload = normalizePayload({
     model: cleanModel,
-    messages: ollamaMessagesToOpenAI(body.messages),
-    tools: ollamaToolsToOpenAI(body.tools),
+    messages: openAiMessages,
+    tools: openAiTools,
     stream: streamMode,
-    ...ollamaOptionsToOpenAI(body.options),
+    ...ollamaOpts,
   });
+
+  // Apply multimodal normalization
+  try {
+    await applyMultimodalNormalization(openAiPayload, openAiMessages);
+  } catch (e) {
+    if (e instanceof MultimodalError) {
+      return sendJson(res, e.status || 400, {
+        error: { message: e.message, code: e.code, details: e.details },
+      });
+    }
+    return sendJson(res, 400, { error: { message: e.message } });
+  }
+
+  // Debug logging
+  logDebugRequestShape("/api/chat", streamMode, requestedModel, openAiPayload.model, openAiPayload);
+  if (config.debugNormalizedPayloads) {
+    logDebugNormalizedPayload(openAiPayload);
+  }
 
   const result = await upstreamChatCompletion(openAiPayload, streamMode);
 
@@ -976,7 +1073,7 @@ async function handleOllamaChat(req, res) {
       }
     }
   } catch (e) {
-    console.warn(`[ollama-stream] ${e.message}`);
+    logOllamaStreamEnd(e.message);
   }
 
   const finalMessage = { role, content: "" };
@@ -1008,6 +1105,63 @@ async function handleOllamaChat(req, res) {
   res.end();
 }
 
+// =============================================================================
+// Debug model-version endpoint
+// =============================================================================
+
+async function handleDebugModelVersion(req, res) {
+  if (!isAuthorized(req)) {
+    return sendJson(res, 401, { error: { message: "Unauthorized local provider key" } });
+  }
+
+  if (!config.debugUpstreamModelVersion) {
+    return sendJson(res, 403, { error: { message: "DEBUG_UPSTREAM_MODEL_VERSION is not enabled" } });
+  }
+
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const requestedModel = url.searchParams.get("model") || defaultModel;
+
+  const key = getNextKey();
+  if (!key) {
+    return sendJson(res, 503, { error: { message: "No available API keys" } });
+  }
+
+  try {
+    const response = await fetch(
+      `${GEMINI_GENERATE_BASE}/${requestedModel}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "authorization": `Bearer ${key.key}`,
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: "." }] }],
+          generationConfig: { maxOutputTokens: 1 },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return sendJson(res, response.status, { error: { message: errorText } });
+    }
+
+    const data = await response.json();
+    sendJson(res, 200, {
+      requestedModel,
+      modelVersion: data.modelVersion || null,
+      responseId: data.candidates?.[0]?.responseId || null,
+    });
+  } catch (e) {
+    sendJson(res, 503, { error: { message: e.message } });
+  }
+}
+
+// =============================================================================
+// HTTP server
+// =============================================================================
+
 export const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -1015,15 +1169,11 @@ export const server = http.createServer(async (req, res) => {
     const normalizedPath = url.pathname.replace(/\/+$|^$/, "") || "/";
 
     if (normalizedPath !== "/health") {
-      console.log(`[req] ${req.method} ${normalizedPath} ua=${req.headers["user-agent"] || "?"}`);
+      logRequestStart(req.method, normalizedPath, req.headers["user-agent"] || "?");
     }
 
     if (req.method === "GET" && normalizedPath === "/health") return handleHealth(req, res);
 
-    // Some OpenAI-compatible clients append /chat/completions themselves.
-    // Therefore support both baseURL styles:
-    //   http://host:port/v1 -> /v1/chat/completions
-    //   http://host:port    -> /chat/completions
     if (req.method === "GET" && ["/v1/models", "/models"].includes(normalizedPath)) {
       return handleModels(req, res);
     }
@@ -1032,7 +1182,12 @@ export const server = http.createServer(async (req, res) => {
       return handleChatCompletions(req, res);
     }
 
-    // Ollama-compatible surface (for VS Code Copilot Chat BYOK).
+    // Debug endpoint (protected by auth + env flag)
+    if (req.method === "GET" && normalizedPath === "/debug/model-version") {
+      return handleDebugModelVersion(req, res);
+    }
+
+    // Ollama-compatible surface
     if (req.method === "GET" && normalizedPath === "/api/version") {
       return handleOllamaVersion(req, res);
     }
@@ -1049,7 +1204,7 @@ export const server = http.createServer(async (req, res) => {
     sendJson(res, 404, {
       error: {
         message: `Not found: ${req.method} ${url.pathname}`,
-        hint: "Use baseURL http://127.0.0.1:8787/v1 or http://127.0.0.1:8787; both /v1/chat/completions and /chat/completions are supported in this build. Ollama-compatible /api/version, /api/tags, /api/show, /api/chat are also exposed."
+        hint: "Use baseURL http://127.0.0.1:8787/v1 or http://127.0.0.1:8787; both /v1/chat/completions and /chat/completions are supported. Ollama-compatible /api/* endpoints are also exposed."
       }
     });
   } catch (e) {
@@ -1077,10 +1232,7 @@ export {
 
 function startServer() {
   server.listen(port, host, () => {
-    console.log(`Gemini failover provider listening on http://${host}:${port}`);
-    console.log(`Loaded ${keyState.length} Gemini API key(s). Default model: ${defaultModel}`);
-    console.log(`Reasoning effort: ${defaultReasoningEffort || "client/default"}${forceReasoningEffort ? " (forced)" : ""}`);
-    console.log(`Thought signature fallback: ${thoughtSignatureDummyFallback ? "dummy-enabled" : "disabled"}`);
+    logStartup(host, port, keyState.length, defaultModel, defaultReasoningEffort, forceReasoningEffort, thoughtSignatureDummyFallback);
   });
 }
 
