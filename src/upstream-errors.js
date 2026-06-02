@@ -99,12 +99,23 @@ export function classifyUpstreamError(status, errorPayload, context = {}) {
   }
 
   if (status === 500) {
+    // Check suspicious unsupported combinations first
+    if (looksLikelyPayloadModelError(context)) {
+      return {
+        kind: "payload_or_model",
+        shouldFailover: false,
+        shouldCooldownKey: false,
+        clientStatus: 502,
+        code: "upstream_model_payload_error",
+        reason: "Upstream 500 likely caused by unsupported model/capability combination",
+      };
+    }
+
     const transientIndicators = [
       "overloaded",
       "temporarily unavailable",
       "try again",
       "unavailable",
-      "internal error",
       "backend error",
       "service error",
       "server error",
@@ -122,18 +133,6 @@ export function classifyUpstreamError(status, errorPayload, context = {}) {
         clientStatus: 502,
         code: "upstream_transient_500",
         reason: "Upstream overloaded or temporarily unavailable (500)",
-      };
-    }
-
-    // Check suspicious unsupported combinations
-    if (looksLikelyPayloadModelError(context)) {
-      return {
-        kind: "payload_or_model",
-        shouldFailover: false,
-        shouldCooldownKey: false,
-        clientStatus: 502,
-        code: "upstream_model_payload_error",
-        reason: "Upstream 500 likely caused by unsupported model/capability combination",
       };
     }
 

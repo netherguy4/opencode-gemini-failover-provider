@@ -13,6 +13,7 @@ const {
   applyKeyFailureState,
   applyClassifiedFailure,
   createKeyState,
+  keyState,
   thoughtSignatureByToolCallId,
   readThoughtSignatureFromToolCall,
   ollamaMessagesToOpenAI,
@@ -1471,11 +1472,13 @@ test("/debug/model-capabilities?model= returns single model info", async () => {
   }
 });
 
-test("/debug/model-capabilities returns 401 without auth", async () => {
+test("/debug/model-capabilities returns 401 with wrong auth", async () => {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const { port } = server.address();
-    const response = await fetch(`http://127.0.0.1:${port}/debug/model-capabilities`);
+    const response = await fetch(`http://127.0.0.1:${port}/debug/model-capabilities`, {
+      headers: { authorization: "Bearer wrong-key" },
+    });
     assert.equal(response.status, 401);
   } finally {
     await new Promise((resolve) => server.close(resolve));
@@ -1661,6 +1664,13 @@ test("fingerprintTracker: integration with classifyUpstreamError stops repeated 
 // =============================================================================
 
 test("/v1/chat/completions: gemini-flash-latest + image + tools is allowed", async () => {
+  // Reset key state to ensure clean state for this test
+  for (const key of keyState) {
+    key.cooldownUntil = 0;
+    key.disabled = false;
+    key.lastError = null;
+  }
+
   let upstreamPayload = null;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {

@@ -1414,6 +1414,7 @@ export {
   thoughtSignatureByToolCallId,
   createThoughtSignatureCache,
   createKeyState,
+  keyState,
   applyKeyFailureState,
   applyClassifiedFailure,
   ollamaMessagesToOpenAI,
