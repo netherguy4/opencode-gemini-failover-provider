@@ -115,3 +115,4 @@ The stream is translated from the upstream chat-completions stream. Existing `/v
 - `previous_response_id` is not supported because the provider is stateless.
 - OpenAI-hosted built-in tools are not implemented locally.
 - Responses API support is an adapter over chat completions, so unsupported Gemini/chat-completions model-capability combinations still return the existing provider errors.
+- Streaming currently translates only text deltas from the upstream chat-completions stream. Tool call deltas (`delta.tool_calls`) are not forwarded in streaming mode; use non-streaming requests if you need tool call results.

@@ -1,5 +1,6 @@
 import { Readable, Writable } from "node:stream";
 import http from "node:http";
+import { config } from "./config.js";
 
 const RESPONSES_PATHS = new Set(["/v1/responses", "/responses"]);
 const UNSUPPORTED_RESPONSES_TOOL_TYPES = new Set([
@@ -38,6 +39,10 @@ function readJsonBody(req) {
     req.setEncoding("utf8");
     req.on("data", (chunk) => {
       body += chunk;
+      if (body.length > config.maxRequestBodyBytes) {
+        reject(new Error("Request body is too large"));
+        req.destroy();
+      }
     });
     req.on("end", () => {
       try {
@@ -69,7 +74,7 @@ function contentText(content) {
 
 function normalizeResponsesContentPart(part) {
   if (typeof part === "string") return { type: "text", text: part };
-  if (!part || typeof part !== "object") return { type: "text", text: "" };
+  if (!part || typeof part !== "object") return null;
 
   if (part.type === "input_text" || part.type === "output_text" || part.type === "text") {
     return { type: "text", text: part.text || "" };
@@ -118,14 +123,25 @@ function normalizeResponsesInput(input) {
   }
 
   const messages = [];
+  let bareParts = [];
+
+  const flushBareParts = () => {
+    if (bareParts.length > 0) {
+      messages.push({ role: "user", content: bareParts });
+      bareParts = [];
+    }
+  };
+
   for (const item of input) {
     if (typeof item === "string") {
+      flushBareParts();
       messages.push({ role: "user", content: item });
       continue;
     }
     if (!item || typeof item !== "object") continue;
 
     if (item.type === "message" || item.role) {
+      flushBareParts();
       const message = {
         role: item.role || "user",
         content: normalizeResponsesContent(item.content),
@@ -138,6 +154,7 @@ function normalizeResponsesInput(input) {
     }
 
     if (item.type === "function_call_output") {
+      flushBareParts();
       messages.push({
         role: "tool",
         tool_call_id: item.call_id || item.id,
@@ -147,9 +164,12 @@ function normalizeResponsesInput(input) {
     }
 
     if (item.type === "input_text" || item.type === "input_image" || item.type === "input_file") {
-      messages.push({ role: "user", content: [normalizeResponsesContentPart(item)] });
+      const normalized = normalizeResponsesContentPart(item);
+      if (normalized) bareParts.push(normalized);
     }
   }
+
+  flushBareParts();
 
   if (messages.length === 0) {
     throw new Error("Responses API `input` did not contain any supported message items.");
@@ -326,6 +346,180 @@ async function callChatCompletions(listener, originalReq, chatPayload) {
   await Promise.resolve(listener(internalReq, internalRes));
   await internalRes.done;
   return internalRes;
+}
+
+class StreamPassthroughResponse extends Writable {
+  constructor(realRes, requestBody, responseId) {
+    super();
+    this.realRes = realRes;
+    this.requestBody = requestBody;
+    this.responseId = responseId;
+    this.statusCode = 200;
+    this.headers = {};
+    this.sseBuffer = "";
+    this.text = "";
+    this.usage = {};
+    this.headersSent = false;
+    this.itemId = `msg_${responseId.slice(5)}`;
+    this.outputIndex = 0;
+    this.contentIndex = 0;
+    this.createdAt = Math.floor(Date.now() / 1000);
+    this.done = new Promise((resolve) => {
+      this._resolveDone = resolve;
+    });
+  }
+
+  writeHead(statusCode, headers = {}) {
+    this.statusCode = statusCode;
+    this.headers = { ...this.headers, ...headers };
+    return this;
+  }
+
+  setHeader(name, value) {
+    this.headers[String(name).toLowerCase()] = value;
+  }
+
+  getHeader(name) {
+    return this.headers[String(name).toLowerCase()];
+  }
+
+  _ensureHeadersSent() {
+    if (this.headersSent) return;
+    if (this.statusCode < 200 || this.statusCode >= 300) {
+      this.realRes.writeHead(this.statusCode, this.headers);
+      this.headersSent = true;
+      return;
+    }
+    const responseBase = {
+      id: this.responseId,
+      object: "response",
+      created_at: this.createdAt,
+      status: "in_progress",
+      model: this.requestBody.model,
+      output: [],
+      output_text: "",
+    };
+    this.realRes.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      "connection": "keep-alive",
+    });
+    this.headersSent = true;
+    writeSse(this.realRes, "response.created", { response: responseBase });
+    writeSse(this.realRes, "response.in_progress", { response: responseBase });
+    writeSse(this.realRes, "response.output_item.added", {
+      output_index: this.outputIndex,
+      item: { id: this.itemId, type: "message", status: "in_progress", role: "assistant", content: [] },
+    });
+    writeSse(this.realRes, "response.content_part.added", {
+      item_id: this.itemId,
+      output_index: this.outputIndex,
+      content_index: this.contentIndex,
+      part: { type: "output_text", text: "", annotations: [] },
+    });
+  }
+
+  _processSseChunk(chunk) {
+    this.sseBuffer += chunk;
+    const lines = this.sseBuffer.split("\n");
+    this.sseBuffer = lines.pop() || "";
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      try {
+        const event = JSON.parse(data);
+        if (event.usage) this.usage = event.usage;
+        const delta = event.choices?.[0]?.delta;
+        if (typeof delta?.content !== "string" || delta.content.length === 0) continue;
+        this.text += delta.content;
+        writeSse(this.realRes, "response.output_text.delta", {
+          item_id: this.itemId,
+          output_index: this.outputIndex,
+          content_index: this.contentIndex,
+          delta: delta.content,
+        });
+      } catch {}
+    }
+  }
+
+  _write(chunk, _encoding, callback) {
+    this._ensureHeadersSent();
+    if (this.statusCode >= 200 && this.statusCode < 300) {
+      const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+      this._processSseChunk(text);
+    } else {
+      this.realRes.write(chunk);
+    }
+    callback();
+  }
+
+  _flushFinalCompletion() {
+    if (this.statusCode < 200 || this.statusCode >= 300) return;
+    const responseBase = {
+      id: this.responseId,
+      object: "response",
+      created_at: this.createdAt,
+      model: this.requestBody.model,
+      output: [],
+      output_text: "",
+    };
+    writeSse(this.realRes, "response.output_text.done", {
+      item_id: this.itemId,
+      output_index: this.outputIndex,
+      content_index: this.contentIndex,
+      text: this.text,
+    });
+    writeSse(this.realRes, "response.content_part.done", {
+      item_id: this.itemId,
+      output_index: this.outputIndex,
+      content_index: this.contentIndex,
+      part: { type: "output_text", text: this.text, annotations: [] },
+    });
+    writeSse(this.realRes, "response.output_item.done", {
+      output_index: this.outputIndex,
+      item: {
+        id: this.itemId,
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: this.text, annotations: [] }],
+      },
+    });
+    writeSse(this.realRes, "response.completed", {
+      response: {
+        ...responseBase,
+        status: "completed",
+        output_text: this.text,
+        output: [{
+          id: this.itemId,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: this.text, annotations: [] }],
+        }],
+        usage: mapUsage(this.usage),
+      },
+    });
+  }
+
+  end(chunk, encoding, callback) {
+    if (chunk) {
+      if (this.statusCode >= 200 && this.statusCode < 300) {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        this._processSseChunk(text);
+      } else {
+        this.realRes.write(chunk);
+      }
+    }
+    this._ensureHeadersSent();
+    this._flushFinalCompletion();
+    this.realRes.end();
+    if (typeof callback === "function") callback();
+    this._resolveDone();
+    return this;
+  }
 }
 
 function extractMessageText(message) {
@@ -530,6 +724,15 @@ async function handleResponses(listener, req, res) {
     return jsonError(res, 400, error.message);
   }
 
+  if (chatPayload.stream === true) {
+    const responseId = createResponseId();
+    const internalReq = createInternalRequest(req, chatPayload);
+    const passthrough = new StreamPassthroughResponse(res, body, responseId);
+    await Promise.resolve(listener(internalReq, passthrough));
+    await passthrough.done;
+    return;
+  }
+
   const chatRes = await callChatCompletions(listener, req, chatPayload);
   const text = chatRes.text();
 
@@ -539,10 +742,6 @@ async function handleResponses(listener, req, res) {
     res.writeHead(chatRes.statusCode, headers);
     res.end(text);
     return;
-  }
-
-  if (chatPayload.stream === true) {
-    return streamChatSseAsResponses(res, text, body);
   }
 
   let chat;
@@ -586,4 +785,5 @@ export {
   normalizeResponsesInput,
   normalizeResponsesContentPart,
   normalizeResponsesTools,
+  normalizeResponsesToolChoice,
 };

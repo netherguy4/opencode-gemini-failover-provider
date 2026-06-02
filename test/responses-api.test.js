@@ -54,6 +54,9 @@ const {
   responsesToChatPayload,
   normalizeResponsesInput,
   normalizeResponsesTools,
+  normalizeResponsesToolChoice,
+  normalizeResponsesContentPart,
+  chatCompletionToResponse,
 } = await import("../src/responses-api-hook.js");
 const { server } = await import("../server.js");
 
@@ -205,4 +208,96 @@ test("/v1/responses streaming translates chat SSE into Responses SSE events", as
   assert.match(result.text, /"delta":"Hel"/);
   assert.match(result.text, /event: response\.completed/);
   assert.match(result.text, /"output_text":"Hello"/);
+});
+
+test("previous_response_id is rejected with 400", async () => {
+  const port = server.listening ? server.address().port : await listen();
+  const result = await request(port, "/v1/responses", {
+    model: "gemini-flash-latest",
+    input: "hello",
+    previous_response_id: "resp_abc123",
+  });
+
+  assert.equal(result.response.status, 400);
+  assert.match(result.parsed.error.message, /previous_response_id/);
+});
+
+test("function_call_output maps to tool role message", () => {
+  const messages = normalizeResponsesInput([
+    { type: "message", role: "assistant", content: "I will look that up" },
+    { type: "function_call_output", call_id: "call_123", output: "Order found: #456" },
+  ]);
+
+  assert.equal(messages.length, 2);
+  assert.equal(messages[1].role, "tool");
+  assert.equal(messages[1].tool_call_id, "call_123");
+  assert.equal(messages[1].content, "Order found: #456");
+});
+
+test("normalizeResponsesToolChoice handles string and function object", () => {
+  assert.equal(normalizeResponsesToolChoice("auto"), "auto");
+  assert.equal(normalizeResponsesToolChoice("none"), "none");
+  assert.deepEqual(
+    normalizeResponsesToolChoice({ type: "function", name: "lookup" }),
+    { type: "function", function: { name: "lookup" } }
+  );
+  assert.deepEqual(
+    normalizeResponsesToolChoice({ type: "function", function: { name: "search" } }),
+    { type: "function", function: { name: "search" } }
+  );
+  assert.equal(normalizeResponsesToolChoice(null), undefined);
+  assert.equal(normalizeResponsesToolChoice(undefined), undefined);
+});
+
+test("Bare content parts accumulate into a single user message", () => {
+  const messages = normalizeResponsesInput([
+    { type: "input_text", text: "Describe this" },
+    { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+  ]);
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, "user");
+  assert.equal(messages[0].content.length, 2);
+  assert.deepEqual(messages[0].content[0], { type: "text", text: "Describe this" });
+  assert.deepEqual(messages[0].content[1], { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } });
+});
+
+test("Invalid content parts are filtered out", () => {
+  assert.equal(normalizeResponsesContentPart(null), null);
+  assert.equal(normalizeResponsesContentPart(undefined), null);
+  assert.equal(normalizeResponsesContentPart(42), null);
+  assert.equal(normalizeResponsesContentPart(false), null);
+});
+
+test("tool_calls in non-streaming response are mapped to function_call output", () => {
+  const chat = {
+    id: "chatcmpl_test",
+    object: "chat.completion",
+    created: 1710000000,
+    model: "gemini-flash-latest",
+    choices: [{
+      index: 0,
+      finish_reason: "tool_calls",
+      message: {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: "call_abc",
+          type: "function",
+          function: { name: "lookup_order", arguments: '{"id":"123"}' },
+        }],
+      },
+    }],
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+  };
+
+  const response = chatCompletionToResponse(chat, { model: "gemini-flash-latest" });
+
+  assert.equal(response.status, "completed");
+  assert.equal(response.output.length, 2);
+  assert.equal(response.output[0].type, "message");
+  assert.equal(response.output[1].type, "function_call");
+  assert.equal(response.output[1].call_id, "call_abc");
+  assert.equal(response.output[1].name, "lookup_order");
+  assert.equal(response.output[1].arguments, '{"id":"123"}');
 });
