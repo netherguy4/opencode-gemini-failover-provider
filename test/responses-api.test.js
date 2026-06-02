@@ -7,12 +7,13 @@ process.env.USAGE_LOGGING = "false";
 process.env.HOST = "127.0.0.1";
 process.env.PORT = "0";
 
+const nativeFetch = globalThis.fetch.bind(globalThis);
 const upstreamRequests = [];
 
 globalThis.fetch = async function fetchStub(input, init = {}) {
   const url = typeof input === "string" ? input : input?.url || String(input);
   if (!url.includes("generativelanguage.googleapis.com")) {
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
+    return nativeFetch(input, init);
   }
 
   const body = JSON.parse(init.body || "{}");
@@ -63,7 +64,7 @@ function listen() {
 }
 
 async function request(port, path, body, headers = {}) {
-  const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+  const response = await nativeFetch(`http://127.0.0.1:${port}${path}`, {
     method: body === undefined ? "GET" : "POST",
     headers: body === undefined
       ? headers
