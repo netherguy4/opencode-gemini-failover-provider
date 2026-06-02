@@ -1,3 +1,5 @@
+import "./responses-api-hook.js";
+
 const enabled = String(process.env.USAGE_LOGGING || "true").toLowerCase() !== "false";
 const originalFetch = globalThis.fetch;
 
