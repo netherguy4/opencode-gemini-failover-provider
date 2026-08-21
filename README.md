@@ -28,7 +28,7 @@ This proxy is meant to improve reliability, not to bypass per-key limits.
 
 - One upstream request per client request — no fan-out across keys at the same time.
 - Honors `Retry-After` if the provider returns it.
-- Puts a key on cooldown after `429`, `5xx`, or timeout.
+- Puts a key/model pair on cooldown after quota errors; `5xx` and timeouts still cool down the whole key.
 - Disables a key after `401`. `403` goes on cooldown.
 - Does not retry ordinary `400` responses (bad request, unsupported model, etc.).
 - Extracts text from file attachments locally and injects it into the prompt.
@@ -86,7 +86,7 @@ All settings come from `.env`. See `.env.example` for the full set.
 | `PORT` | `8787` | Server port. |
 | `PUBLISHED_HOST` | `127.0.0.1` | Host interface Docker publishes the port on (`127.0.0.1` = local only, `0.0.0.0` = LAN). |
 | `MAX_ATTEMPTS_PER_REQUEST` | `3` | How many keys to try per request before giving up. |
-| `KEY_COOLDOWN_MS` | `60000` | Cooldown duration after `429`/`5xx`/timeout. |
+| `KEY_COOLDOWN_MS` | `60000` | Cooldown duration after quota errors/`5xx`/timeout. Quota cooldowns are tracked per model. |
 | `UPSTREAM_TIMEOUT_MS` | `300000` | Per-attempt upstream timeout. |
 | `REASONING_EFFORT` | `` | Default reasoning effort: `none`, `minimal`, `low`, `medium`, `high`. |
 | `FORCE_REASONING_EFFORT` | `false` | If `true`, always replace the client's reasoning effort with `REASONING_EFFORT`. |
@@ -484,7 +484,7 @@ It will not burn every API key on repeated same-payload 500s.
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `upstream_model_payload_error` | Unsupported model/capability combo | Use Gemini Flash, disable images/tools/reasoning, or enable capability override |
-| Repeated 429 | quota/rate limit | Add quota, wait cooldown, reduce request rate |
+| Repeated 429 | quota/rate limit for the requested model | Try another model, add quota, wait cooldown, or reduce request rate |
 | Gemma fails with images/tools | Gemma capability mismatch | Use Gemini model or opt in with env flags after testing |
 
 ## Troubleshooting

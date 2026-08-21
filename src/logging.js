@@ -163,8 +163,8 @@ export function logKeyDisabled(keyIndex, totalKeys, maskedKey) {
   console.warn(`[disabled] key=${keyIndex}/${totalKeys} ${maskedKey}`);
 }
 
-export function logKeyCooldown(keyIndex, totalKeys, until) {
-  console.warn(`[cooldown] key=${keyIndex}/${totalKeys} until=${new Date(until).toISOString()}`);
+export function logKeyCooldown(keyIndex, totalKeys, until, model = "") {
+  console.warn(`[cooldown] key=${keyIndex}/${totalKeys}${model ? ` model=${model}` : ""} until=${new Date(until).toISOString()}`);
 }
 
 export function logStreamEnd(message) {

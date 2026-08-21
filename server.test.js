@@ -190,6 +190,17 @@ test("403 puts key on cooldown while 401 disables key", () => {
   assert.equal(keyState[1].disabled, true);
 });
 
+test("model quota cooldown does not block the same key for another model", () => {
+  const [key] = createKeyState(["k1"]);
+  applyClassifiedFailure(key, {
+    kind: "rate_limit", shouldCooldownKey: true,
+  }, new Headers(), "gemini-3.1-flash-lite");
+
+  assert.equal(key.cooldownUntil, 0);
+  assert.equal(key.modelCooldowns.get("gemini-3.1-flash-lite") > Date.now(), true);
+  assert.equal(key.modelCooldowns.has("gemini-3-flash-preview"), false);
+});
+
 test("/v1/chat/completions strips Ollama-style :latest from model name", async () => {
   let upstreamModel = null;
   const originalFetch = globalThis.fetch;
@@ -1667,6 +1678,7 @@ test("/v1/chat/completions: gemini-flash-latest + image + tools is allowed", asy
   // Reset key state to ensure clean state for this test
   for (const key of keyState) {
     key.cooldownUntil = 0;
+    key.modelCooldowns.clear();
     key.disabled = false;
     key.lastError = null;
   }
@@ -1708,6 +1720,46 @@ test("/v1/chat/completions: gemini-flash-latest + image + tools is allowed", asy
       }),
     });
     assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("/v1/chat/completions: quota on one model leaves the key usable for another", async () => {
+  for (const key of keyState) {
+    key.cooldownUntil = 0;
+    key.modelCooldowns.clear();
+    key.disabled = false;
+  }
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (typeof url === "string" && url.includes("generativelanguage.googleapis.com")) {
+      const { model } = JSON.parse(init.body);
+      return new Response(model === "gemini-3.1-flash-lite"
+        ? JSON.stringify({ error: { message: "Rate limit exceeded" } })
+        : JSON.stringify({ choices: [{ message: { content: "4837" } }] }), {
+        status: model === "gemini-3.1-flash-lite" ? 429 : 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return originalFetch(url, init);
+  };
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address();
+    const request = (model) => fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: "captcha" }] }),
+    });
+
+    const limited = await request("gemini-3.1-flash-lite");
+    assert.equal(limited.status, 429);
+    assert.equal((await limited.json()).error.code, "model_quota_exhausted");
+    assert.equal((await request("gemini-3-flash-preview")).status, 200);
   } finally {
     globalThis.fetch = originalFetch;
     await new Promise((resolve) => server.close(resolve));
