@@ -75,6 +75,7 @@ function createKeyState(inputKeys) {
     key,
     index,
     cooldownUntil: 0,
+    modelCooldowns: new Map(),
     disabled: false,
     lastError: null,
   }));
@@ -148,12 +149,15 @@ function now() {
   return Date.now();
 }
 
-function getNextKey() {
+function getNextKey(model = "") {
   const t = now();
   for (let i = 0; i < keyState.length; i++) {
     const idx = (cursor + i) % keyState.length;
     const state = keyState[idx];
-    if (!state.disabled && state.cooldownUntil <= t) {
+    for (const [name, until] of state.modelCooldowns) {
+      if (until <= t) state.modelCooldowns.delete(name);
+    }
+    if (!state.disabled && state.cooldownUntil <= t && (state.modelCooldowns.get(model) || 0) <= t) {
       cursor = (idx + 1) % keyState.length;
       return state;
     }
@@ -224,13 +228,16 @@ function shouldFailover(status, errorPayload) {
   );
 }
 
-function applyClassifiedFailure(key, classification, headers) {
+function applyClassifiedFailure(key, classification, headers, model = "") {
   const totalKeysForLog = Math.max(keyState.length, key.index + 1);
 
   if (classification.shouldCooldownKey) {
     const cooldownMs = retryAfterMs(headers) || keyCooldownMs;
-    key.cooldownUntil = now() + Math.max(keyCooldownMs, cooldownMs);
-    logKeyCooldown(key.index + 1, totalKeysForLog, key.cooldownUntil);
+    const cooldownUntil = now() + Math.max(keyCooldownMs, cooldownMs);
+    const perModel = model && ["quota", "rate_limit"].includes(classification.kind);
+    if (perModel) key.modelCooldowns.set(model, cooldownUntil);
+    else key.cooldownUntil = cooldownUntil;
+    logKeyCooldown(key.index + 1, totalKeysForLog, cooldownUntil, perModel ? model : "");
   }
 
   if (classification.kind === "key_auth") {
@@ -535,13 +542,14 @@ async function upstreamChatCompletion(payload, streamMode, requestContext = {}) 
   const fingerprint = createRequestFingerprint(requestShape);
 
   for (let attempt = 1; attempt <= attemptsLimit; attempt++) {
-    let key = getNextKey();
+    let key = getNextKey(payload.model);
 
     if (!key) {
-      const soonest = Math.min(...keyState.filter((k) => !k.disabled).map((k) => k.cooldownUntil));
+      const soonest = Math.min(...keyState.filter((k) => !k.disabled)
+        .map((k) => Math.max(k.cooldownUntil, k.modelCooldowns.get(payload.model) || 0)));
       const wait = Number.isFinite(soonest) ? Math.max(250, soonest - now()) : 1000;
       await delay(Math.min(wait, 2000));
-      key = getNextKey();
+      key = getNextKey(payload.model);
       if (!key) break;
     }
 
@@ -619,7 +627,7 @@ async function upstreamChatCompletion(payload, streamMode, requestContext = {}) 
         }
       }
 
-      applyClassifiedFailure(key, classification, response.headers);
+      applyClassifiedFailure(key, classification, response.headers, payload.model);
     } catch (e) {
       clearTimeout(timeout);
       key.lastError = e.message;
@@ -629,13 +637,18 @@ async function upstreamChatCompletion(payload, streamMode, requestContext = {}) 
     }
   }
 
+  const modelQuotaCooling = keyState.some((key) => !key.disabled && key.cooldownUntil <= now()) &&
+    keyState.filter((key) => !key.disabled && key.cooldownUntil <= now())
+      .every((key) => (key.modelCooldowns.get(payload.model) || 0) > now());
+  const quotaExhausted = modelQuotaCooling || (errors.length > 0 &&
+    errors.every((error) => ["quota", "rate_limit"].includes(error.kind)));
   return {
     response: null,
-    errorStatus: 503,
+    errorStatus: quotaExhausted ? 429 : 503,
     errorPayload: {
       error: {
-        message: "All Gemini keys failed or are cooling down",
-        code: "all_keys_exhausted",
+        message: quotaExhausted ? `All Gemini keys are rate-limited for ${payload.model}` : "All Gemini keys failed or are cooling down",
+        code: quotaExhausted ? "model_quota_exhausted" : "all_keys_exhausted",
         attempts: errors,
       },
     },
@@ -1286,7 +1299,7 @@ async function handleDebugModelVersion(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const requestedModel = url.searchParams.get("model") || defaultModel;
 
-  const key = getNextKey();
+  const key = getNextKey(requestedModel);
   if (!key) {
     return sendJson(res, 503, { error: { message: "No available API keys" } });
   }
