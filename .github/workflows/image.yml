@@ -55,10 +55,16 @@ jobs:
 
       # По одному вебхуку на экземпляр сервиса, по строке на URL. Секрет, а не
       # константа: refreshToken в публичном репозитории — это чужой деплой.
+      # Контекст secrets в `if` недоступен, поэтому пустоту проверяем в шелле.
       - name: Redeploy in Dokploy
-        if: ${{ secrets.DOKPLOY_WEBHOOK_URLS != '' }}
+        env:
+          WEBHOOK_URLS: ${{ secrets.DOKPLOY_WEBHOOK_URLS }}
         run: |
-          printf '%s\n' "${{ secrets.DOKPLOY_WEBHOOK_URLS }}" | while read -r url; do
+          if [ -z "$WEBHOOK_URLS" ]; then
+            echo "DOKPLOY_WEBHOOK_URLS не задан — редеплой пропущен"
+            exit 0
+          fi
+          printf '%s\n' "$WEBHOOK_URLS" | while read -r url; do
             [ -n "$url" ] || continue
             curl -fsS --retry 3 --retry-delay 5 "$url"
           done
