@@ -1,0 +1,64 @@
+name: LLM provider image
+
+# Образ собирается здесь, а не на серверах Dokploy: те только забирают готовый
+# image из ghcr. Сборка на месте означала бы разный артефакт на каждом хосте и
+# npm install на слабом VPS.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server.js"
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+      - "Dockerfile"
+      - ".github/workflows/image.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: llm-provider-image
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/opencode-gemini-failover-provider
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Битый образ до ghcr не доедет.
+      - run: npm ci
+      - run: npm test
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      # По одному вебхуку на экземпляр сервиса, по строке на URL. Секрет, а не
+      # константа: refreshToken в публичном репозитории — это чужой деплой.
+      - name: Redeploy in Dokploy
+        if: ${{ secrets.DOKPLOY_WEBHOOK_URLS != '' }}
+        run: |
+          printf '%s\n' "${{ secrets.DOKPLOY_WEBHOOK_URLS }}" | while read -r url; do
+            [ -n "$url" ] || continue
+            curl -fsS --retry 3 --retry-delay 5 "$url"
+          done
